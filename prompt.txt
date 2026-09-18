@@ -1,0 +1,874 @@
+# FLOWFORGE — STAGE 1 IMPLEMENTATION
+
+You are the implementation engineer for Stage 1 of FlowForge.
+
+## PROJECT
+
+FlowForge is a distributed job orchestration platform.
+
+The final system will eventually support:
+
+* asynchronous job execution
+* multiple workers
+* retries
+* exponential backoff
+* dead-letter queues
+* worker leases
+* crash recovery
+* scheduling
+* priorities
+* rate limiting
+* workflow/DAG execution
+* idempotency
+* observability
+* Docker
+* CI/CD
+* Kubernetes/cloud deployment
+
+BUT THIS TASK IS ONLY STAGE 1.
+
+Do not implement future-stage functionality unless it is required to keep the architecture extensible.
+
+---
+
+# STAGE 1 OBJECTIVE
+
+Build the smallest useful version of FlowForge:
+
+Client
+→ Go REST API
+→ PostgreSQL
+→ Redis Stream
+→ Worker
+→ PostgreSQL
+
+The system must allow a client to submit a background job, have a worker execute it, and query the job status/result.
+
+---
+
+# TECHNOLOGY
+
+Use:
+
+* Go
+* PostgreSQL
+* Redis
+* Docker
+* Docker Compose
+* GitHub Actions
+
+HTTP framework:
+
+Prefer the Go standard library or Chi unless there is a strong reason to use something else.
+
+Database:
+
+Use PostgreSQL with pgx.
+
+Redis:
+
+Use Redis Streams.
+
+Do not introduce Kafka yet.
+
+Use a conventional SQL migration approach such as goose or another lightweight migration tool. Explain the choice in documentation.
+
+---
+
+# IMPORTANT ARCHITECTURAL PRINCIPLE
+
+The architecture must remain modular.
+
+Do not put business logic directly inside HTTP handlers.
+
+Do not put database logic inside workers.
+
+Do not tightly couple task execution to Redis.
+
+Separate:
+
+API layer
+↓
+Job service
+↓
+Repository
+↓
+Queue abstraction
+
+and:
+
+Worker
+↓
+Queue consumer
+↓
+Task registry
+↓
+Task handler
+↓
+Job repository
+
+Future stages must be able to replace or extend individual components.
+
+---
+
+# REQUIRED STAGE 1 FEATURES
+
+## 1. Job creation
+
+Implement:
+
+POST /jobs
+
+Example request:
+
+{
+"type": "echo",
+"payload": {
+"message": "hello FlowForge"
+}
+}
+
+Return:
+
+{
+"job_id": "...",
+"status": "QUEUED"
+}
+
+---
+
+## 2. Job retrieval
+
+Implement:
+
+GET /jobs/{id}
+
+Return something similar to:
+
+{
+"id": "...",
+"type": "echo",
+"status": "COMPLETED",
+"payload": {
+"message": "hello FlowForge"
+},
+"result": {
+"message": "hello FlowForge"
+},
+"error": null,
+"created_at": "...",
+"started_at": "...",
+"completed_at": "..."
+}
+
+---
+
+## 3. Job listing
+
+Implement:
+
+GET /jobs
+
+Support basic pagination.
+
+Do not build advanced filtering yet.
+
+---
+
+## 4. Job states
+
+Stage 1 supports:
+
+PENDING
+QUEUED
+RUNNING
+COMPLETED
+FAILED
+
+Use explicit state transition logic.
+
+Do not allow arbitrary state transitions.
+
+For example:
+
+PENDING → QUEUED
+QUEUED → RUNNING
+RUNNING → COMPLETED
+RUNNING → FAILED
+
+Document valid transitions.
+
+---
+
+# DATABASE
+
+Create a jobs table.
+
+Use UUID identifiers.
+
+Suggested fields:
+
+id
+type
+payload
+status
+result
+error
+created_at
+started_at
+completed_at
+
+Use JSONB for payload and result.
+
+Add appropriate indexes.
+
+At minimum consider indexing:
+
+status
+created_at
+
+Use constraints where appropriate.
+
+Do not add retry-related columns yet unless there is a clear architectural reason.
+
+---
+
+# REDIS
+
+Use a Redis Stream.
+
+Suggested stream:
+
+flowforge:jobs
+
+Use a consumer group even though Stage 1 only has one worker.
+
+Suggested group:
+
+flowforge-workers
+
+Stage 1 should demonstrate:
+
+XADD
+XREADGROUP
+XACK
+
+Do NOT implement:
+
+* XAUTOCLAIM
+* dead-letter queues
+* retry queues
+* delayed queues
+* leases
+
+Those belong to later stages.
+
+Document that Stage 1 deliberately does not provide crash recovery.
+
+---
+
+# JOB FLOW
+
+POST /jobs should roughly perform:
+
+1. Validate request.
+2. Create job in PostgreSQL.
+3. Publish a job message to Redis.
+4. Update job state to QUEUED.
+5. Return job ID.
+
+The system has a known dual-write limitation between PostgreSQL and Redis.
+
+Do NOT solve this with a transactional outbox in Stage 1.
+
+Document this limitation explicitly because the transactional outbox will be introduced in a later stage.
+
+If Redis publishing fails after the PostgreSQL insert, the job may remain PENDING.
+
+Do not hide or fake reliability that does not exist.
+
+---
+
+# REDIS MESSAGE
+
+A queue message should contain enough information for a worker to locate the job.
+
+Example:
+
+{
+"job_id": "...",
+"type": "echo"
+}
+
+Do not place unnecessary duplicated business state in Redis.
+
+PostgreSQL remains the source of truth for job state.
+
+---
+
+# WORKER
+
+Create a separate executable:
+
+cmd/worker
+
+The worker should:
+
+1. Connect to PostgreSQL.
+2. Connect to Redis.
+3. Create/verify its consumer group.
+4. Block waiting for jobs.
+5. Receive a job.
+6. Load the job from PostgreSQL.
+7. Mark it RUNNING.
+8. Execute the registered task handler.
+9. Store result or error.
+10. Mark job COMPLETED or FAILED.
+11. Acknowledge the Redis message.
+
+Do not build worker pools yet.
+
+Only one worker process and one consumer are required in Stage 1.
+
+---
+
+# TASK SYSTEM
+
+Do not hard-code all task logic inside the worker.
+
+Create a task handler abstraction.
+
+For example conceptually:
+
+TaskHandler interface
+
+with something like:
+
+Handle(ctx, payload) → result/error
+
+Create a task registry.
+
+Initially implement only:
+
+1. echo
+2. sleep
+
+The echo task returns the supplied message.
+
+The sleep task waits for a requested number of seconds and then returns successfully.
+
+This allows the system to demonstrate actual asynchronous execution.
+
+Validate payloads.
+
+Do not execute arbitrary code supplied by users.
+
+---
+
+# ERROR HANDLING
+
+Handle:
+
+* invalid JSON
+* missing required fields
+* unknown job type
+* job not found
+* PostgreSQL failure
+* Redis failure
+* task failure
+* malformed task payload
+
+Return sensible HTTP status codes.
+
+Use structured application errors internally.
+
+Do not leak database or internal implementation details through the API.
+
+---
+
+# HTTP API
+
+At minimum:
+
+POST /jobs
+GET /jobs/{id}
+GET /jobs
+GET /healthz
+GET /readyz
+
+Health:
+
+/healthz means the process is alive.
+
+/readyz verifies required dependencies are available.
+
+Do not make health endpoints overly complicated.
+
+---
+
+# CONFIGURATION
+
+Use environment variables.
+
+Create:
+
+.env.example
+
+Include configuration for:
+
+DATABASE_URL
+REDIS_URL
+REDIS_STREAM
+REDIS_CONSUMER_GROUP
+SERVER_PORT
+
+Do not commit secrets.
+
+---
+
+# LOGGING
+
+Use structured logging.
+
+Prefer Go's standard structured logger or another lightweight approach.
+
+Every important operation should log useful context such as:
+
+job_id
+job_type
+status
+error
+
+Do not log entire job payloads unnecessarily.
+
+---
+
+# PROJECT STRUCTURE
+
+Use a clean structure approximately like:
+
+cmd/
+api/
+worker/
+
+internal/
+api/
+jobs/
+queue/
+worker/
+tasks/
+database/
+
+migrations/
+
+tests/
+
+docs/
+architecture/
+stages/
+api/
+adr/
+
+scripts/
+
+Keep responsibilities separated.
+
+Do not create abstractions that have no current purpose.
+
+---
+
+# TESTING
+
+You MUST write automated tests.
+
+## Unit tests
+
+Test:
+
+* job validation
+* job state transitions
+* task registry
+* echo handler
+* sleep handler
+* service logic
+
+## Integration tests
+
+Test:
+
+API
++
+PostgreSQL
++
+Redis
+
+The integration test should verify the complete flow:
+
+POST /jobs
+→ job created
+→ Redis message exists
+→ worker processes it
+→ status becomes COMPLETED
+→ result is available
+
+Also test failure:
+
+task execution fails
+→ status becomes FAILED
+→ error is stored
+
+## API tests
+
+Test:
+
+201/200 success responses
+400 malformed requests
+404 unknown jobs
+appropriate 5xx dependency failures
+
+## Concurrency/race checks
+
+The code should pass:
+
+go test -race ./...
+
+---
+
+# DOCKER
+
+Create:
+
+Dockerfile
+
+docker-compose.yml
+
+Docker Compose should run:
+
+api
+worker
+postgres
+redis
+
+The system should work from:
+
+docker compose up --build
+
+Provide health checks where practical.
+
+Do not introduce Kubernetes.
+
+---
+
+# MAKEFILE
+
+Create useful commands such as:
+
+make build
+make test
+make test-race
+make lint
+make run-api
+make run-worker
+make docker-up
+make docker-down
+
+Make commands should be simple and reliable.
+
+---
+
+# CI
+
+Create GitHub Actions CI.
+
+On every pull request and push:
+
+1. Check formatting.
+2. Run go vet.
+3. Run unit tests.
+4. Run race tests.
+5. Build API.
+6. Build worker.
+7. Build Docker image.
+8. Run integration tests with PostgreSQL and Redis.
+
+Do not create deployment pipelines yet.
+
+This stage establishes CI foundations; deployment/CD will be expanded later.
+
+---
+
+# DOCUMENTATION
+
+Create:
+
+docs/stages/stage-01.md
+
+It must explain:
+
+* objective
+* architecture
+* components
+* job lifecycle
+* API
+* database schema
+* Redis model
+* worker model
+* known limitations
+* testing
+* how to run locally
+* how to run with Docker
+* acceptance criteria
+* what is intentionally NOT implemented
+
+Create:
+
+docs/architecture/stage-01.md
+
+Include an architecture diagram using Mermaid.
+
+Create:
+
+docs/api/openapi.yaml
+
+Document the Stage 1 API.
+
+---
+
+# ADR
+
+Create an ADR explaining the decision to use:
+
+PostgreSQL as the source of truth.
+
+Create another ADR explaining:
+
+Redis Streams as the initial queue mechanism.
+
+Each ADR should include:
+
+Context
+Decision
+Alternatives
+Trade-offs
+Consequences
+
+---
+
+# README
+
+The README should contain:
+
+Project description
+Architecture diagram
+Features
+Tech stack
+Quick start
+API examples
+How workers operate
+Testing
+Roadmap
+
+Do not claim features that have not been implemented.
+
+---
+
+# DEMO
+
+Create a reproducible demo script.
+
+For example:
+
+scripts/demo.ps1
+
+and/or
+
+scripts/demo.sh
+
+The demo should:
+
+1. Create an echo job.
+2. Print the job ID.
+3. Poll the job.
+4. Show RUNNING.
+5. Show COMPLETED.
+6. Show the final result.
+
+Also demonstrate a sleep task.
+
+The goal is that I can show another person the system in under 2 minutes.
+
+---
+
+# SECURITY
+
+For Stage 1:
+
+* validate input
+* do not execute arbitrary code
+* do not commit secrets
+* do not expose internal errors
+* constrain payload sizes reasonably
+
+Full authentication/RBAC will be a later stage.
+
+---
+
+# NON-FUNCTIONAL REQUIREMENTS
+
+The system should be:
+
+* modular
+* testable
+* observable through logs
+* deterministic where practical
+* easy to run locally
+* Dockerized
+* CI-tested
+
+Prioritize correctness and understandability over premature optimization.
+
+---
+
+# FAILURE LIMITATIONS TO DOCUMENT
+
+Stage 1 deliberately does NOT guarantee recovery from:
+
+* worker crashes
+* duplicate execution
+* Redis failure between enqueue and processing
+* PostgreSQL/Redis dual-write inconsistency
+* abandoned RUNNING jobs
+
+These become later stages.
+
+Do not pretend Stage 1 is production fault tolerant.
+
+---
+
+# GITHUB WORKFLOW
+
+Create:
+
+stage/01-basic-job-execution
+
+Use small meaningful commits.
+
+Suggested commit sequence:
+
+chore: bootstrap Go project
+
+feat(db): add jobs schema and repository
+
+feat(queue): add Redis stream publisher
+
+feat(api): add job submission endpoint
+
+feat(worker): add job consumer and execution
+
+feat(tasks): add task registry and handlers
+
+feat(api): add job status and listing
+
+test: add job execution integration tests
+
+ci: add GitHub Actions pipeline
+
+docs: document stage 1 architecture
+
+docs: add stage 1 demo
+
+Do not squash away meaningful history unless necessary.
+
+---
+
+# IMPLEMENTATION PROCESS
+
+Before changing code:
+
+1. Inspect the repository.
+2. Inspect AGENTS.md.
+3. Inspect existing docs.
+4. Explain the Stage 1 implementation plan.
+5. Identify important design decisions.
+6. Identify files you expect to create/change.
+
+Then implement Stage 1.
+
+After implementation:
+
+1. Run formatting.
+2. Run vet.
+3. Run tests.
+4. Run race detection.
+5. Run integration tests.
+6. Build API.
+7. Build worker.
+8. Build Docker image.
+9. Run Docker Compose.
+10. Execute the demo.
+11. Review for dead code and unnecessary abstractions.
+12. Update documentation.
+13. Show the final file tree.
+14. Summarize what was implemented.
+15. List known limitations.
+16. List any remaining issues.
+
+---
+
+# CRITICAL CONSTRAINTS
+
+Do NOT implement:
+
+* retries
+* exponential backoff
+* priority queues
+* scheduling
+* cron
+* worker pools
+* leases
+* heartbeats
+* crash recovery
+* DLQ
+* idempotency
+* workflow engine
+* Kafka
+* Kubernetes
+* distributed locks
+* autoscaling
+
+Those belong to future stages.
+
+Do not solve future problems prematurely.
+
+However, structure the current interfaces so later stages can extend them without rewriting the entire codebase.
+
+---
+
+# FINAL ACCEPTANCE CRITERIA
+
+Stage 1 is complete only when:
+
+1. `docker compose up --build` successfully starts the system.
+2. API accepts a job.
+3. Job appears in PostgreSQL.
+4. Job is published to Redis.
+5. Worker consumes it.
+6. Worker executes the registered task.
+7. Job becomes COMPLETED.
+8. Result is persisted.
+9. Failed task becomes FAILED.
+10. GET /jobs/{id} returns correct state.
+11. GET /jobs supports pagination.
+12. Health/readiness endpoints work.
+13. Integration tests pass.
+14. `go test -race ./...` passes.
+15. CI passes.
+16. README is accurate.
+17. Stage documentation exists.
+18. Architecture diagram exists.
+19. API specification exists.
+20. Demo script works.
+
+Do not move to Stage 2 until every acceptance criterion is satisfied.
+
+After finishing, stop and produce a Stage 1 completion report rather than beginning Stage 2.
