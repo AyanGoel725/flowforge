@@ -128,12 +128,16 @@ graph TD
 ```mermaid
 graph TB
     subgraph Docker Compose
+        MIGRATE_C[migrate<br/>init container]
         API_C[api<br/>:8080]
         WORKER_C[worker]
-        PG_C[postgres<br/>:5432]
+        PG_C[postgres<br/>:5432 / host: 5433]
         REDIS_C[redis<br/>:6379]
     end
 
+    MIGRATE_C -->|applies migrations| PG_C
+    API_C -.->|depends on completion| MIGRATE_C
+    WORKER_C -.->|depends on completion| MIGRATE_C
     API_C --> PG_C
     API_C --> REDIS_C
     WORKER_C --> PG_C
@@ -143,8 +147,10 @@ graph TB
 ## Key Design Decisions
 
 1. **PostgreSQL is the source of truth** — Redis holds queue pointers only. See [ADR-001](../adr/001-postgresql-source-of-truth.md).
-2. **Redis Streams for queueing** — lightweight, consumer-group-ready. See [ADR-002](../adr/002-redis-streams-queue.md).
+2. **Redis Streams for queueing** — lightweight, consumer-group-ready with bounded retention (`MaxLen: 10000, Approx: true`). See [ADR-002](../adr/002-redis-streams-queue.md).
 3. **Queue abstraction** — `internal/queue` defines `Publisher` and `Consumer` interfaces. Redis is the current implementation; Kafka can be swapped in later.
 4. **Task registry** — handlers register by name; the worker dispatches by job type. New task types require only a new handler + registration.
-5. **Goose migrations** — SQL-based, no ORM, version-controlled schema changes.
-6. **Chi router** — lightweight, idiomatic, stdlib-compatible middleware chain.
+5. **Decoupled Readiness Probes** — `/readyz` utilizes the abstract `Pinger` interface for PostgreSQL and Redis health checks without exposing internal drivers.
+6. **Worker Resilience & Panic Recovery** — Worker recovers from task panics via `recover()`, marking jobs `FAILED` with sanitized error messages and acknowledging queue messages to prevent blocking. Graceful shutdown uses an isolated 5-second context to finalize job status and queue ACKs.
+7. **Goose migrations** — SQL-based, no ORM, version-controlled schema changes applied via a dedicated migration runner.
+8. **Chi router** — lightweight, idiomatic, stdlib-compatible middleware chain.

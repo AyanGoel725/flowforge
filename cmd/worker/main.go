@@ -67,7 +67,10 @@ func main() {
 	registry := tasks.NewRegistry()
 	registry.Register("echo", &tasks.EchoHandler{})
 	registry.Register("sleep", &tasks.SleepHandler{})
-	logger.Info("registered task handlers", "handlers", []string{"echo", "sleep"})
+	registry.Register("flaky", tasks.NewFlakyHandler())
+	registry.Register("always_fail", &tasks.AlwaysFailHandler{})
+	registry.Register("permanent_fail", &tasks.PermanentFailHandler{})
+	logger.Info("registered task handlers", "handlers", []string{"echo", "sleep", "flaky", "always_fail", "permanent_fail"})
 
 	// 5. Construct worker
 	w := worker.New(consumer, repo, registry, logger)

@@ -5,22 +5,28 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
 
 // MockRepository implements Repository in-memory for testing.
 type MockRepository struct {
-	jobs      map[uuid.UUID]*Job
-	createErr error
-	getErr    error
-	updateErr error
-	listErr   error
+	jobs             map[uuid.UUID]*Job
+	outboxEvents     map[uuid.UUID]*OutboxEvent
+	attempts         map[uuid.UUID][]*JobAttempt
+	createErr        error
+	createOutboxErr  error
+	getErr           error
+	updateErr        error
+	listErr          error
 }
 
 func NewMockRepository() *MockRepository {
 	return &MockRepository{
-		jobs: make(map[uuid.UUID]*Job),
+		jobs:         make(map[uuid.UUID]*Job),
+		outboxEvents: make(map[uuid.UUID]*OutboxEvent),
+		attempts:     make(map[uuid.UUID][]*JobAttempt),
 	}
 }
 
@@ -32,6 +38,22 @@ func (m *MockRepository) Create(ctx context.Context, job *Job) error {
 		job.ID = uuid.New()
 	}
 	m.jobs[job.ID] = job
+	return nil
+}
+
+func (m *MockRepository) CreateWithOutbox(ctx context.Context, job *Job, event *OutboxEvent) error {
+	if m.createOutboxErr != nil {
+		return m.createOutboxErr
+	}
+	if job.ID == uuid.Nil {
+		job.ID = uuid.New()
+	}
+	if event.ID == uuid.Nil {
+		event.ID = uuid.New()
+	}
+	event.AggregateID = job.ID
+	m.jobs[job.ID] = job
+	m.outboxEvents[event.ID] = event
 	return nil
 }
 
@@ -70,7 +92,17 @@ func (m *MockRepository) UpdateStatus(ctx context.Context, id uuid.UUID, from, t
 }
 
 func (m *MockRepository) SetRunning(ctx context.Context, id uuid.UUID) error {
-	return m.UpdateStatus(ctx, id, StatusQueued, StatusRunning)
+	job, ok := m.jobs[id]
+	if !ok || job.Status != StatusQueued {
+		return ErrInvalidState
+	}
+	job.Status = StatusRunning
+	job.AttemptCount++
+	now := time.Now()
+	if job.StartedAt == nil {
+		job.StartedAt = &now
+	}
+	return nil
 }
 
 func (m *MockRepository) SetCompleted(ctx context.Context, id uuid.UUID, result json.RawMessage) error {
@@ -78,6 +110,8 @@ func (m *MockRepository) SetCompleted(ctx context.Context, id uuid.UUID, result 
 		return err
 	}
 	m.jobs[id].Result = result
+	now := time.Now()
+	m.jobs[id].CompletedAt = &now
 	return nil
 }
 
@@ -86,27 +120,64 @@ func (m *MockRepository) SetFailed(ctx context.Context, id uuid.UUID, errMsg str
 		return err
 	}
 	m.jobs[id].Error = &errMsg
+	m.jobs[id].LastError = &errMsg
+	now := time.Now()
+	m.jobs[id].CompletedAt = &now
 	return nil
 }
 
-// MockPublisher implements queue.Publisher.
-type MockPublisher struct {
-	published []uuid.UUID
-	err       error
-}
-
-func (p *MockPublisher) Publish(ctx context.Context, jobID uuid.UUID, jobType string) error {
-	if p.err != nil {
-		return p.err
+func (m *MockRepository) SetRetryWait(ctx context.Context, id uuid.UUID, errMsg string, nextAttemptAt time.Time) error {
+	if err := m.UpdateStatus(ctx, id, StatusRunning, StatusRetryWait); err != nil {
+		return err
 	}
-	p.published = append(p.published, jobID)
+	m.jobs[id].LastError = &errMsg
+	m.jobs[id].NextAttemptAt = &nextAttemptAt
 	return nil
+}
+
+func (m *MockRepository) ProcessPendingOutboxEvents(ctx context.Context, limit int, processor OutboxProcessor) (int, error) {
+	count := 0
+	for _, event := range m.outboxEvents {
+		if event.Status == OutboxStatusPending {
+			if err := processor(ctx, event); err == nil {
+				event.Status = OutboxStatusPublished
+				if job, ok := m.jobs[event.AggregateID]; ok && job.Status == StatusPending {
+					job.Status = StatusQueued
+				}
+				count++
+			}
+		}
+	}
+	return count, nil
+}
+
+func (m *MockRepository) ProcessRetryEligibleJobs(ctx context.Context, limit int, processor RetryProcessor) (int, error) {
+	count := 0
+	now := time.Now()
+	for _, job := range m.jobs {
+		if job.Status == StatusRetryWait && job.NextAttemptAt != nil && !job.NextAttemptAt.After(now) {
+			if err := processor(ctx, job); err == nil {
+				job.Status = StatusQueued
+				job.NextAttemptAt = nil
+				count++
+			}
+		}
+	}
+	return count, nil
+}
+
+func (m *MockRepository) RecordAttempt(ctx context.Context, attempt *JobAttempt) error {
+	m.attempts[attempt.JobID] = append(m.attempts[attempt.JobID], attempt)
+	return nil
+}
+
+func (m *MockRepository) GetAttemptsByJobID(ctx context.Context, jobID uuid.UUID) ([]*JobAttempt, error) {
+	return m.attempts[jobID], nil
 }
 
 func TestService_CreateJob_Success(t *testing.T) {
 	repo := NewMockRepository()
-	pub := &MockPublisher{}
-	svc := NewService(repo, pub, nil)
+	svc := NewService(repo, nil)
 
 	req := &CreateJobRequest{
 		Type:    "echo",
@@ -118,39 +189,31 @@ func TestService_CreateJob_Success(t *testing.T) {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
-	if job.Status != StatusQueued {
-		t.Errorf("expected job status %s, got %s", StatusQueued, job.Status)
-	}
-
-	if len(pub.published) != 1 || pub.published[0] != job.ID {
-		t.Errorf("expected job ID %s to be published", job.ID)
-	}
-}
-
-func TestService_CreateJob_PublishFailure(t *testing.T) {
-	repo := NewMockRepository()
-	pub := &MockPublisher{err: errors.New("redis unavailable")}
-	svc := NewService(repo, pub, nil)
-
-	req := &CreateJobRequest{
-		Type:    "echo",
-		Payload: json.RawMessage(`{"message": "hello"}`),
-	}
-
-	job, err := svc.CreateJob(context.Background(), req)
-	if err != nil {
-		t.Fatalf("expected graceful return of PENDING job, got error: %v", err)
-	}
-
 	if job.Status != StatusPending {
-		t.Errorf("expected job status %s on publish failure, got %s", StatusPending, job.Status)
+		t.Errorf("expected job status %s, got %s", StatusPending, job.Status)
+	}
+
+	if len(repo.jobs) != 1 {
+		t.Fatalf("expected 1 job in repo, got %d", len(repo.jobs))
+	}
+
+	if len(repo.outboxEvents) != 1 {
+		t.Fatalf("expected 1 outbox event in repo, got %d", len(repo.outboxEvents))
+	}
+
+	for _, event := range repo.outboxEvents {
+		if event.AggregateID != job.ID {
+			t.Errorf("expected outbox event aggregate ID %s, got %s", job.ID, event.AggregateID)
+		}
+		if event.EventType != "JOB_CREATED" {
+			t.Errorf("expected event type JOB_CREATED, got %s", event.EventType)
+		}
 	}
 }
 
 func TestService_CreateJob_ValidationError(t *testing.T) {
 	repo := NewMockRepository()
-	pub := &MockPublisher{}
-	svc := NewService(repo, pub, nil)
+	svc := NewService(repo, nil)
 
 	req := &CreateJobRequest{
 		Type:    "",
@@ -165,7 +228,7 @@ func TestService_CreateJob_ValidationError(t *testing.T) {
 
 func TestService_GetJob(t *testing.T) {
 	repo := NewMockRepository()
-	svc := NewService(repo, nil, nil)
+	svc := NewService(repo, nil)
 
 	jobID := uuid.New()
 	repo.jobs[jobID] = &Job{
@@ -190,7 +253,7 @@ func TestService_GetJob(t *testing.T) {
 
 func TestService_ListJobs(t *testing.T) {
 	repo := NewMockRepository()
-	svc := NewService(repo, nil, nil)
+	svc := NewService(repo, nil)
 
 	id1 := uuid.New()
 	id2 := uuid.New()

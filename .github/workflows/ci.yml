@@ -17,7 +17,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26.x'
           cache: true
 
       - name: Go vet
@@ -41,7 +41,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26.x'
           cache: true
 
       - name: Run unit tests
@@ -57,14 +57,20 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26.x'
           cache: true
 
       - name: Build API
         run: go build -v ./cmd/api
 
+      - name: Build Dispatcher
+        run: go build -v ./cmd/dispatcher
+
       - name: Build Worker
         run: go build -v ./cmd/worker
+
+      - name: Build Migrate
+        run: go build -v ./cmd/migrate
 
   integration:
     name: Integration Tests
@@ -99,7 +105,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26.x'
           cache: true
 
       - name: Run integration tests
@@ -120,5 +126,11 @@ jobs:
       - name: Build API Docker Image
         run: docker build --build-arg TARGET=api -t flowforge-api:test .
 
+      - name: Build Dispatcher Docker Image
+        run: docker build --build-arg TARGET=dispatcher -t flowforge-dispatcher:test .
+
       - name: Build Worker Docker Image
         run: docker build --build-arg TARGET=worker -t flowforge-worker:test .
+
+      - name: Build Migrate Docker Image
+        run: docker build --build-arg TARGET=migrate -t flowforge-migrate:test .

@@ -3,8 +3,8 @@ info:
   title: FlowForge API
   description: |
     FlowForge is a distributed job orchestration platform.
-    Stage 1 provides basic asynchronous job submission, execution, and status retrieval.
-  version: "0.1.0"
+    Stage 2 provides reliable execution, transactional outbox, and automatic retries.
+  version: "0.2.0"
   license:
     name: MIT
 
@@ -18,9 +18,8 @@ paths:
       operationId: createJob
       summary: Submit a new job
       description: |
-        Creates a job in PostgreSQL, publishes it to the Redis stream,
-        and returns the job ID. The job starts in PENDING and transitions
-        to QUEUED once the Redis publish succeeds.
+        Creates a job in PostgreSQL (PENDING) and records a transactional outbox event.
+        The job is later flushed to Redis by the dispatcher, ensuring reliability.
       requestBody:
         required: true
         content:
@@ -40,6 +39,21 @@ paths:
                   type: sleep
                   payload:
                     seconds: 5
+              flaky:
+                summary: Flaky task (retries twice, succeeds on third)
+                value:
+                  type: flaky
+                  payload: {}
+              always_fail:
+                summary: Transient failing task (exhausts retries)
+                value:
+                  type: always_fail
+                  payload: {}
+              permanent_fail:
+                summary: Permanent failing task (fails immediately)
+                value:
+                  type: permanent_fail
+                  payload: {}
       responses:
         "201":
           description: Job created
@@ -180,21 +194,27 @@ components:
       properties:
         type:
           type: string
-          enum: [echo, sleep]
+          enum: [echo, sleep, flaky, always_fail, permanent_fail]
           description: Task type to execute
         payload:
           type: object
           description: Task-specific payload (JSONB)
+        max_attempts:
+          type: integer
+          description: Maximum number of execution attempts before permanent failure. Defaults to 3.
+          minimum: 1
 
     CreateJobResponse:
       type: object
       properties:
-        job_id:
+        id:
           type: string
           format: uuid
+        type:
+          type: string
         status:
           type: string
-          enum: [QUEUED]
+          enum: [PENDING]
 
     Job:
       type: object
@@ -206,7 +226,7 @@ components:
           type: string
         status:
           type: string
-          enum: [PENDING, QUEUED, RUNNING, COMPLETED, FAILED]
+          enum: [PENDING, QUEUED, RUNNING, COMPLETED, FAILED, RETRY_WAIT]
         payload:
           type: object
         result:
@@ -215,10 +235,24 @@ components:
         error:
           type: string
           nullable: true
+        last_error:
+          type: string
+          nullable: true
+          description: Error message from the previous failed attempt
+        attempt_count:
+          type: integer
+          description: Number of attempts made so far
+        max_attempts:
+          type: integer
+          description: Maximum allowed attempts
         created_at:
           type: string
           format: date-time
         started_at:
+          type: string
+          format: date-time
+          nullable: true
+        next_attempt_at:
           type: string
           format: date-time
           nullable: true

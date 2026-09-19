@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -14,11 +16,16 @@ import (
 )
 
 type mockRepo struct {
-	jobs map[uuid.UUID]*jobs.Job
+	jobs     map[uuid.UUID]*jobs.Job
+	attempts map[uuid.UUID][]*jobs.JobAttempt
+	events   []*jobs.OutboxEvent
 }
 
 func newMockRepo() *mockRepo {
-	return &mockRepo{jobs: make(map[uuid.UUID]*jobs.Job)}
+	return &mockRepo{
+		jobs:     make(map[uuid.UUID]*jobs.Job),
+		attempts: make(map[uuid.UUID][]*jobs.JobAttempt),
+	}
 }
 
 func (m *mockRepo) Create(ctx context.Context, job *jobs.Job) error {
@@ -26,6 +33,15 @@ func (m *mockRepo) Create(ctx context.Context, job *jobs.Job) error {
 		job.ID = uuid.New()
 	}
 	m.jobs[job.ID] = job
+	return nil
+}
+
+func (m *mockRepo) CreateWithOutbox(ctx context.Context, job *jobs.Job, event *jobs.OutboxEvent) error {
+	if job.ID == uuid.Nil {
+		job.ID = uuid.New()
+	}
+	m.jobs[job.ID] = job
+	m.events = append(m.events, event)
 	return nil
 }
 
@@ -74,6 +90,32 @@ func (m *mockRepo) SetFailed(ctx context.Context, id uuid.UUID, errMsg string) e
 	return nil
 }
 
+func (m *mockRepo) SetRetryWait(ctx context.Context, id uuid.UUID, errMsg string, nextAttemptAt time.Time) error {
+	if err := m.UpdateStatus(ctx, id, jobs.StatusRunning, jobs.StatusRetryWait); err != nil {
+		return err
+	}
+	m.jobs[id].LastError = &errMsg
+	m.jobs[id].NextAttemptAt = &nextAttemptAt
+	return nil
+}
+
+func (m *mockRepo) ProcessPendingOutboxEvents(ctx context.Context, limit int, processor jobs.OutboxProcessor) (int, error) {
+	return 0, nil
+}
+
+func (m *mockRepo) ProcessRetryEligibleJobs(ctx context.Context, limit int, processor jobs.RetryProcessor) (int, error) {
+	return 0, nil
+}
+
+func (m *mockRepo) RecordAttempt(ctx context.Context, attempt *jobs.JobAttempt) error {
+	m.attempts[attempt.JobID] = append(m.attempts[attempt.JobID], attempt)
+	return nil
+}
+
+func (m *mockRepo) GetAttemptsByJobID(ctx context.Context, jobID uuid.UUID) ([]*jobs.JobAttempt, error) {
+	return m.attempts[jobID], nil
+}
+
 type mockPublisher struct {
 	err error
 }
@@ -82,10 +124,18 @@ func (p *mockPublisher) Publish(ctx context.Context, jobID uuid.UUID, jobType st
 	return p.err
 }
 
+type mockPinger struct {
+	err error
+}
+
+func (p *mockPinger) Ping(ctx context.Context) error {
+	return p.err
+}
+
 func setupTestRouter() (*chiRouterWrapper, *mockRepo, *mockPublisher) {
 	repo := newMockRepo()
 	pub := &mockPublisher{}
-	svc := jobs.NewService(repo, pub, nil)
+	svc := jobs.NewService(repo, nil)
 	r := NewRouter(svc, nil, nil, nil)
 	return &chiRouterWrapper{r}, repo, pub
 }
@@ -135,8 +185,8 @@ func TestHandleCreateJob(t *testing.T) {
 		if resp.Type != "echo" {
 			t.Errorf("expected type 'echo', got '%s'", resp.Type)
 		}
-		if resp.Status != jobs.StatusQueued {
-			t.Errorf("expected status QUEUED, got %s", resp.Status)
+		if resp.Status != jobs.StatusPending {
+			t.Errorf("expected status PENDING, got %s", resp.Status)
 		}
 	})
 
@@ -233,32 +283,122 @@ func TestHandleListJobs(t *testing.T) {
 	repo.jobs[id1] = &jobs.Job{ID: id1, Type: "echo", Status: jobs.StatusQueued}
 	repo.jobs[id2] = &jobs.Job{ID: id2, Type: "sleep", Status: jobs.StatusCompleted}
 
-	req := httptest.NewRequest(http.MethodGet, "/jobs?limit=10&offset=0", nil)
-	rec := httptest.NewRecorder()
+	t.Run("successful list with query params", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/jobs?limit=10&offset=0", nil)
+		rec := httptest.NewRecorder()
 
-	router.ServeHTTP(rec, req)
+		router.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", rec.Code)
-	}
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d", rec.Code)
+		}
 
-	var resp listJobsResponse
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
-	if resp.Total != 2 {
-		t.Errorf("expected total 2, got %d", resp.Total)
-	}
+		var resp listJobsResponse
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if resp.Total != 2 {
+			t.Errorf("expected total 2, got %d", resp.Total)
+		}
+	})
+
+	t.Run("invalid limit parameter", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/jobs?limit=abc", nil)
+		rec := httptest.NewRecorder()
+
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for invalid limit, got %d", rec.Code)
+		}
+	})
+
+	t.Run("negative limit parameter", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/jobs?limit=-5", nil)
+		rec := httptest.NewRecorder()
+
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for negative limit, got %d", rec.Code)
+		}
+	})
+
+	t.Run("invalid offset parameter", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/jobs?offset=invalid", nil)
+		rec := httptest.NewRecorder()
+
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for invalid offset, got %d", rec.Code)
+		}
+	})
 }
 
-func TestHandleReady_NilDeps(t *testing.T) {
-	handler := handleReady(nil, nil)
-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
-	rec := httptest.NewRecorder()
+func TestHandleReady_Scenarios(t *testing.T) {
+	t.Run("nil dependencies", func(t *testing.T) {
+		handler := handleReady(nil, nil)
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		rec := httptest.NewRecorder()
 
-	handler(rec, req)
+		handler(rec, req)
 
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 for nil dependencies, got %d", rec.Code)
-	}
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 for nil dependencies, got %d", rec.Code)
+		}
+	})
+
+	t.Run("both dependencies healthy", func(t *testing.T) {
+		pg := &mockPinger{}
+		rdb := &mockPinger{}
+		handler := handleReady(pg, rdb)
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		rec := httptest.NewRecorder()
+
+		handler(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 when healthy, got %d", rec.Code)
+		}
+
+		var body map[string]interface{}
+		if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if body["status"] != "ok" {
+			t.Errorf("expected status 'ok', got %v", body["status"])
+		}
+	})
+
+	t.Run("postgres unhealthy", func(t *testing.T) {
+		pg := &mockPinger{err: errors.New("connection refused")}
+		rdb := &mockPinger{}
+		handler := handleReady(pg, rdb)
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		rec := httptest.NewRecorder()
+
+		handler(rec, req)
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 when postgres unhealthy, got %d", rec.Code)
+		}
+	})
+
+	t.Run("redis unhealthy", func(t *testing.T) {
+		pg := &mockPinger{}
+		rdb := &mockPinger{err: errors.New("redis timeout")}
+		handler := handleReady(pg, rdb)
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		rec := httptest.NewRecorder()
+
+		handler(rec, req)
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 when redis unhealthy, got %d", rec.Code)
+		}
+	})
 }

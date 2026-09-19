@@ -5,14 +5,12 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/redis/go-redis/v9"
 
 	"github.com/flowforge/flowforge/internal/jobs"
 )
 
 // NewRouter constructs the chi router for the FlowForge HTTP API.
-func NewRouter(service *jobs.Service, pool *pgxpool.Pool, rdb *redis.Client, logger *slog.Logger) http.Handler {
+func NewRouter(service *jobs.Service, pg Pinger, rdb Pinger, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -26,7 +24,7 @@ func NewRouter(service *jobs.Service, pool *pgxpool.Pool, rdb *redis.Client, log
 
 	// Liveness and Readiness
 	r.Get("/healthz", handleHealth())
-	r.Get("/readyz", handleReady(pool, rdb))
+	r.Get("/readyz", handleReady(pg, rdb))
 
 	// Jobs API
 	r.Route("/jobs", func(r chi.Router) {

@@ -17,7 +17,7 @@ import (
 	"github.com/flowforge/flowforge/internal/config"
 	"github.com/flowforge/flowforge/internal/database"
 	"github.com/flowforge/flowforge/internal/jobs"
-	"github.com/flowforge/flowforge/internal/queue"
+	_ "github.com/flowforge/flowforge/internal/queue"
 )
 
 func main() {
@@ -52,7 +52,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 4. Connect to Redis
+	// 4. Connect to Redis (API uses Redis for queue-based health checks, though not used during job creation anymore)
 	redisOpts, err := redis.ParseURL(cfg.RedisURL)
 	if err != nil {
 		logger.Error("invalid redis URL", "error", err)
@@ -69,11 +69,11 @@ func main() {
 
 	// 5. Initialize dependencies
 	repo := jobs.NewPostgresRepository(pgPool)
-	publisher := queue.NewRedisPublisher(rdb, cfg.RedisStream)
-	service := jobs.NewService(repo, publisher, logger)
+	// API no longer publishes to Redis directly - uses Transactional Outbox pattern instead!
+	service := jobs.NewService(repo, logger)
 
 	// 6. Construct HTTP router
-	handler := api.NewRouter(service, pgPool, rdb, logger)
+	handler := api.NewRouter(service, pgPool, api.NewRedisPinger(rdb), logger)
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", cfg.ServerPort),

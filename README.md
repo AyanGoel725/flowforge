@@ -8,61 +8,77 @@ FlowForge is a resilient, distributed background job processing and orchestratio
 
 ---
 
-## Stage 1: Async Task Execution Engine
+## Stage 2: Reliable Delivery & Retry Engine
 
-In Stage 1, FlowForge implements the fundamental asynchronous execution pipeline:
-- **REST API** for job ingestion and querying (built on `chi/v5` and standard library `net/http`).
-- **PostgreSQL** as the single source of truth for all job states, timestamps, payloads, and results (using `pgx/v5` connection pooling).
-- **Redis Streams** as the distributed FIFO message queue (`go-redis/v9` with consumer groups via `XADD`/`XREADGROUP`/`XACK`).
-- **Worker Daemon** consuming tasks sequentially and executing registered task handlers (`echo` and `sleep`).
-- **Automated migrations** embedded into the binary with `pressly/goose/v3`.
+Stage 2 eliminates the distributed dual-write window and provides end-to-end execution reliability:
+
+- **Transactional Outbox Pattern**: Job creation (`jobs`) and outbox event publication (`outbox_events`) are committed atomically within a single PostgreSQL transaction (`pgx.Tx`), decoupling HTTP ingestion from Redis availability.
+- **Outbox & Retry Dispatcher Daemon (`cmd/dispatcher`)**: A dedicated background service that concurrently polls `outbox_events` and retry-eligible jobs (`status = 'RETRY_WAIT' AND next_attempt_at <= NOW()`) using `SELECT ... FOR UPDATE SKIP LOCKED` to publish tasks to Redis Streams.
+- **Worker Replay Guard & Idempotency**: Workers validate `status == 'QUEUED'` and perform atomic conditional updates (`UPDATE jobs SET status = 'RUNNING', attempt_count = attempt_count + 1 WHERE id = $1 AND status = 'QUEUED'`) to guarantee safety against duplicate or out-of-order Redis deliveries.
+- **Immutable Execution History (`job_attempts`)**: Every task execution records a detailed history row with `job_id`, `attempt_number`, `worker_id`, `status`, `error`, `started_at`, and `finished_at`.
+- **Explicit Error Classification**: Differentiates retryable errors (`tasks.NewRetryableError`) from permanent failures (`tasks.NewPermanentError`).
+- **Exponential Backoff with Full Jitter**: Non-blocking backoff calculation spreading retries to prevent thundering herd spikes.
 
 ```
                       +-------------------+
                       |    HTTP Client    |
                       +---------+---------+
                                 |
-               1. POST /jobs    |    5. GET /jobs/{id}
+               1. POST /jobs    |    6. GET /jobs/{id}
                                 v
                       +---------+---------+
                       |   FlowForge API   |
-                      +---+-----------+---+
-                          |           |
-            2. INSERT     |           | 3. XADD
-            (PENDING)     |           | (QUEUED)
-                          v           v
-                 +--------+---+   +---+--------+
-                 | PostgreSQL |   |Redis Stream|
-                 +--------+---+   +---+--------+
-                          ^           |
-            4. UPDATE     |           | 4. XREADGROUP
-            (RUNNING)     |           |
-            (COMPLETED)   |           |
-                          +-----+-----+
-                                |
                       +---------+---------+
-                      | FlowForge Worker  |
-                      +-------------------+
+                                |
+                   2. ATOMIC DB TRANSACTION
+                   (INSERT INTO jobs + INSERT INTO outbox_events)
+                                v
+                 +--------------+--------------+
+                 |          PostgreSQL         |
+                 |  jobs, outbox_events,       |
+                 |  job_attempts               |
+                 +-------+--------------+------+
+                         |              ^
+             3. SELECT   |              | 5. UPDATE
+             FOR UPDATE  |              |    (RUNNING,
+             SKIP LOCKED |              |     COMPLETED,
+                         v              |     RETRY_WAIT)
+                 +-------+------+       |
+                 |  Dispatcher  |       |
+                 +-------+------+       |
+                         |              |
+               4. XADD   |              |
+                         v              |
+                 +-------+------+       |
+                 | Redis Stream |       |
+                 +-------+------+       |
+                         |              |
+           4. XREADGROUP |              |
+                         v              |
+                 +-------+------+-------+
+                 |   FlowForge Worker   |
+                 +----------------------+
 ```
 
 ---
 
-## Job State Machine
-
-All state transitions are strictly validated and enforced using optimistic concurrency:
+## Job State Machine (Stage 2)
 
 ```
-[ PENDING ] ──(queue)──> [ QUEUED ] ──(worker pickup)──> [ RUNNING ]
-                                                            ├──(success)──> [ COMPLETED ]
-                                                            └──(failure)──> [ FAILED ]
+[ PENDING ] ──(outbox flush)──> [ QUEUED ] ──(worker pickup)──> [ RUNNING ]
+                                    ▲                               ├──(success)─────────────────────────> [ COMPLETED ]
+                                    │                               ├──(permanent error OR attempts >= max)─> [ FAILED ]
+                                    └───(retry wait expired)────────┴──(retryable error & attempts < max)──> [ RETRY_WAIT ]
 ```
 
-| From State | To State | Trigger | Constraint Guard |
-|---|---|---|---|
-| `PENDING` | `QUEUED` | Published to Redis Stream | Transition only |
-| `QUEUED` | `RUNNING` | Worker picked up message | Sets `started_at = now()` |
-| `RUNNING` | `COMPLETED` | Task handler returned nil error | Sets `result`, `completed_at = now()` |
-| `RUNNING` | `FAILED` | Task handler returned error / panic | Sets `error`, `completed_at = now()` |
+| State | Description | Next Allowed States |
+|---|---|---|
+| `PENDING` | Created atomically in DB with outbox event | `QUEUED` |
+| `QUEUED` | Published to Redis Stream by Dispatcher | `RUNNING` |
+| `RUNNING` | Acquired by Worker via conditional `UPDATE` | `COMPLETED`, `FAILED`, `RETRY_WAIT` |
+| `RETRY_WAIT` | Failed transiently; awaiting exponential backoff | `QUEUED` |
+| `COMPLETED` | Task finished successfully; result saved | *Terminal* |
+| `FAILED` | Permanent error or maximum attempts exhausted | *Terminal* |
 
 ---
 
@@ -75,21 +91,21 @@ All state transitions are strictly validated and enforced using optimistic concu
 git clone https://github.com/flowforge/flowforge.git
 cd flowforge
 
-# Start all services (PostgreSQL, Redis, API, Worker)
+# Start all services (PostgreSQL, Redis, API, Dispatcher, Worker)
 docker compose up --build -d
 
-# Verify services are healthy
+# Verify all containers are healthy
 docker compose ps
 ```
 
-### Running the Live Demo
+### Running the Live Stage 2 Demo
 
 ```bash
 # On Linux / macOS
-./scripts/demo.sh
+./scripts/demo-stage2.sh
 
 # On Windows PowerShell
-./scripts/demo.ps1
+./scripts/demo-stage2.ps1
 ```
 
 ---
@@ -100,8 +116,8 @@ docker compose ps
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/healthz` | Basic process liveness probe |
-| `GET` | `/readyz` | Dependency readiness probe (PostgreSQL & Redis ping) |
+| `GET` | `/healthz` | Process liveness probe |
+| `GET` | `/readyz` | Dependency readiness probe (PostgreSQL & Redis check) |
 
 ### Jobs
 
@@ -111,126 +127,80 @@ POST /jobs
 Content-Type: application/json
 
 {
-  "type": "echo",
-  "payload": {
-    "message": "Hello FlowForge"
-  }
+  "type": "flaky",
+  "payload": {},
+  "max_attempts": 3
 }
 ```
+
 **Response (`201 Created`):**
 ```json
 {
   "id": "e8a939bf-f166-4f40-a3bc-223450949d01",
-  "type": "echo",
-  "status": "QUEUED",
-  "created_at": "2026-09-18T20:30:00Z"
+  "type": "flaky",
+  "status": "PENDING"
 }
 ```
 
-#### 2. Get Job Status & Result
+#### 2. Get Job Status & History
 ```bash
 GET /jobs/e8a939bf-f166-4f40-a3bc-223450949d01
 ```
+
 **Response (`200 OK`):**
 ```json
 {
   "id": "e8a939bf-f166-4f40-a3bc-223450949d01",
-  "type": "echo",
-  "payload": {
-    "message": "Hello FlowForge"
-  },
+  "type": "flaky",
+  "payload": {},
   "status": "COMPLETED",
+  "attempt_count": 3,
+  "max_attempts": 3,
   "result": {
-    "message": "Hello FlowForge"
+    "flaky_status": "succeeded on attempt 3"
   },
-  "created_at": "2026-09-18T20:30:00Z",
-  "started_at": "2026-09-18T20:30:01Z",
-  "completed_at": "2026-09-18T20:30:01Z"
-}
-```
-
-#### 3. List Jobs (Paginated)
-```bash
-GET /jobs?limit=20&offset=0
-```
-**Response (`200 OK`):**
-```json
-{
-  "jobs": [ ... ],
-  "total": 42,
-  "limit": 20,
-  "offset": 0
+  "created_at": "2026-09-20T10:00:00Z",
+  "started_at": "2026-09-20T10:00:04Z",
+  "completed_at": "2026-09-20T10:00:04Z"
 }
 ```
 
 ---
 
-## Task Types (Stage 1)
+## Task Types (Stage 2)
 
-1. **`echo`**:
-   - Payload: `{"message": "string"}`
-   - Result: returns the input payload verbatim.
-2. **`sleep`**:
-   - Payload: `{"seconds": integer}` (1 to 300)
-   - Result: `{"slept_seconds": integer}`
+| Task Type | Behavior | Classification |
+|---|---|---|
+| `echo` | Returns the input payload | Success |
+| `sleep` | Pauses execution for $N$ seconds | Success |
+| `flaky` | Fails on attempts 1 & 2 with retryable errors; succeeds on attempt 3 | Transient Retryable |
+| `always_fail` | Returns a retryable error on every attempt until `max_attempts` is reached | Transient Retryable (Exhausts) |
+| `permanent_fail` | Returns a permanent error; fails immediately without retrying | Permanent (Non-Retryable) |
 
 ---
 
 ## Development & Testing
 
 ```bash
-# Run all unit tests with race detector
+# Run unit tests with race detector
 make test-race
 
 # Run linter
 make lint
 
-# Run integration tests (requires local PostgreSQL & Redis)
+# Run integration tests (includes full Stage 2 reliability suite)
 make test-integration
 
-# Build binaries locally
+# Build all binaries (api, dispatcher, worker, migrate)
 make build
 ```
 
 ---
 
-## Project Structure
+## Architectural Decision Records (ADRs)
 
-```
-flowforge/
-├── .github/workflows/ci.yml       # GitHub Actions CI pipeline
-├── cmd/
-│   ├── api/main.go               # HTTP API server entry point
-│   └── worker/main.go            # Worker daemon entry point
-├── docs/
-│   ├── adr/                      # Architectural Decision Records
-│   ├── api/openapi.yaml          # OpenAPI 3.1 Specification
-│   ├── architecture/stage-01.md  # Architecture documentation & diagrams
-│   └── stages/                   # Implementation plans & stage blueprints
-├── internal/
-│   ├── api/                      # Routing, handlers, middleware, errors
-│   ├── config/                   # Environment configuration loader
-│   ├── database/                 # Postgres connection pool & embedded migrations
-│   ├── jobs/                     # Job domain models, repository, service, transitions
-│   ├── queue/                    # Queue abstraction (Redis Streams publisher/consumer)
-│   ├── tasks/                    # Task handler interface, registry, echo & sleep handlers
-│   └── worker/                   # Worker loop, message dispatch, execution
-├── migrations/                   # Plain SQL Goose schema migrations
-├── scripts/
-│   ├── demo.sh                   # Bash demo script
-│   └── demo.ps1                  # PowerShell demo script
-├── tests/
-│   └── integration/              # End-to-end integration tests
-├── Dockerfile                    # Multi-stage production container build
-├── docker-compose.yml            # Local orchestration stack
-├── Makefile                      # Build and test shortcuts
-└── go.mod
-```
-
----
-
-## Stage 1 Design Decisions & Known Limitations
-
-- **Dual-write without outbox**: If PostgreSQL succeeds and Redis fails, the job remains in `PENDING` status. (Transactional Outbox is scheduled for Stage 2).
-- **At-least-once message delivery**: Workers acknowledge messages (`XACK`) after database updates. If a worker crashes mid-task, job remains in `RUNNING`. (Lease renewal & zombie reclamation scheduled for Stage 3).
-- **In-memory sequential worker loop**: Concurrency controls, dynamic pools, and rate limits will be introduced in future stages.
+- [ADR-001: PostgreSQL as the Source of Truth](docs/adr/001-postgresql-source-of-truth.md)
+- [ADR-002: Redis Streams for Job Queueing](docs/adr/002-redis-streams-queue.md)
+- [ADR-003: Transactional Outbox Pattern for Dual-Write Elimination](docs/adr/003-transactional-outbox.md)
+- [ADR-004: At-Least-Once Publication and Worker Replay Guard](docs/adr/004-at-least-once-publication.md)
+- [ADR-005: Explicit Error Classification and Exponential Backoff](docs/adr/005-retry-policy.md)

@@ -5,6 +5,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -20,7 +21,6 @@ import (
 	"github.com/flowforge/flowforge/internal/config"
 	"github.com/flowforge/flowforge/internal/database"
 	"github.com/flowforge/flowforge/internal/jobs"
-	"github.com/flowforge/flowforge/internal/queue"
 )
 
 func setupTestApp(t *testing.T) (http.Handler, *jobs.Service, *config.Config) {
@@ -58,10 +58,9 @@ func setupTestApp(t *testing.T) (http.Handler, *jobs.Service, *config.Config) {
 	}
 
 	repo := jobs.NewPostgresRepository(pgPool)
-	publisher := queue.NewRedisPublisher(rdb, cfg.RedisStream)
-	service := jobs.NewService(repo, publisher, logger)
+	service := jobs.NewService(repo, logger)
 
-	router := api.NewRouter(service, pgPool, rdb, logger)
+	router := api.NewRouter(service, pgPool, api.NewRedisPinger(rdb), logger)
 	return router, service, cfg
 }
 
@@ -123,5 +122,22 @@ func TestAPI_InvalidInputs(t *testing.T) {
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
 		t.Errorf("expected 404 for missing job, got %d", w.Code)
+	}
+
+	// 5. Oversized payload
+	largeObj := make(map[string]string)
+	for i := 0; i < 50000; i++ {
+		largeObj[fmt.Sprintf("key%d", i)] = "long_value_string"
+	}
+	largeJSON, _ := json.Marshal(map[string]interface{}{
+		"type":    "echo",
+		"payload": largeObj,
+	})
+	req = httptest.NewRequest(http.MethodPost, "/jobs", bytes.NewBuffer(largeJSON))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for oversized payload, got %d", w.Code)
 	}
 }

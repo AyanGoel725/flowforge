@@ -1,599 +1,700 @@
-# FLOWFORGE — STAGE 1 IMPLEMENTATION
+# FLOWFORGE — STAGE 2 IMPLEMENTATION
 
-You are the implementation engineer for Stage 1 of FlowForge.
-
-## PROJECT
+You are the implementation engineer for Stage 2 of FlowForge.
 
 FlowForge is a distributed job orchestration platform.
 
-The final system will eventually support:
+Stage 1 is complete and tagged v0.1.0.
 
-* asynchronous job execution
-* multiple workers
-* retries
-* exponential backoff
-* dead-letter queues
-* worker leases
-* crash recovery
-* scheduling
-* priorities
-* rate limiting
-* workflow/DAG execution
-* idempotency
-* observability
-* Docker
-* CI/CD
-* Kubernetes/cloud deployment
+Your responsibility is to implement:
 
-BUT THIS TASK IS ONLY STAGE 1.
+# STAGE 2 — RELIABLE DELIVERY & RETRY ENGINE
 
-Do not implement future-stage functionality unless it is required to keep the architecture extensible.
+The objective is to improve the reliability of job publication and introduce a robust retry engine while preserving the existing architecture.
 
 ---
 
-# STAGE 1 OBJECTIVE
+# CURRENT STAGE 1 ARCHITECTURE
 
-Build the smallest useful version of FlowForge:
+The current system contains:
 
-Client
-→ Go REST API
-→ PostgreSQL
-→ Redis Stream
-→ Worker
-→ PostgreSQL
+Go API
+PostgreSQL
+Redis Streams
+single worker
+task registry
+echo task
+sleep task
+job state machine
+Docker
+CI
+integration tests
 
-The system must allow a client to submit a background job, have a worker execute it, and query the job status/result.
+The major Stage 1 limitation is the PostgreSQL + Redis dual-write problem.
 
----
-
-# TECHNOLOGY
-
-Use:
-
-* Go
-* PostgreSQL
-* Redis
-* Docker
-* Docker Compose
-* GitHub Actions
-
-HTTP framework:
-
-Prefer the Go standard library or Chi unless there is a strong reason to use something else.
-
-Database:
-
-Use PostgreSQL with pgx.
-
-Redis:
-
-Use Redis Streams.
-
-Do not introduce Kafka yet.
-
-Use a conventional SQL migration approach such as goose or another lightweight migration tool. Explain the choice in documentation.
+Stage 2 addresses this with a Transactional Outbox.
 
 ---
 
-# IMPORTANT ARCHITECTURAL PRINCIPLE
+# STRICT STAGE 2 BOUNDARY
 
-The architecture must remain modular.
+IN SCOPE:
 
-Do not put business logic directly inside HTTP handlers.
+- Transactional Outbox
+- Outbox Events table
+- Outbox Dispatcher
+- At-least-once publication
+- Duplicate delivery handling
+- Job attempt history
+- Retry policy
+- Retryable vs permanent errors
+- Retry count
+- Maximum attempts
+- Exponential backoff
+- Retry timing
+- Retry metrics
+- Reliability integration tests
 
-Do not put database logic inside workers.
+OUT OF SCOPE:
 
-Do not tightly couple task execution to Redis.
-
-Separate:
-
-API layer
-↓
-Job service
-↓
-Repository
-↓
-Queue abstraction
-
-and:
-
-Worker
-↓
-Queue consumer
-↓
-Task registry
-↓
-Task handler
-↓
-Job repository
-
-Future stages must be able to replace or extend individual components.
-
----
-
-# REQUIRED STAGE 1 FEATURES
-
-## 1. Job creation
-
-Implement:
-
-POST /jobs
-
-Example request:
-
-{
-"type": "echo",
-"payload": {
-"message": "hello FlowForge"
-}
-}
-
-Return:
-
-{
-"job_id": "...",
-"status": "QUEUED"
-}
-
----
-
-## 2. Job retrieval
-
-Implement:
-
-GET /jobs/{id}
-
-Return something similar to:
-
-{
-"id": "...",
-"type": "echo",
-"status": "COMPLETED",
-"payload": {
-"message": "hello FlowForge"
-},
-"result": {
-"message": "hello FlowForge"
-},
-"error": null,
-"created_at": "...",
-"started_at": "...",
-"completed_at": "..."
-}
-
----
-
-## 3. Job listing
-
-Implement:
-
-GET /jobs
-
-Support basic pagination.
-
-Do not build advanced filtering yet.
-
----
-
-## 4. Job states
-
-Stage 1 supports:
-
-PENDING
-QUEUED
-RUNNING
-COMPLETED
-FAILED
-
-Use explicit state transition logic.
-
-Do not allow arbitrary state transitions.
-
-For example:
-
-PENDING → QUEUED
-QUEUED → RUNNING
-RUNNING → COMPLETED
-RUNNING → FAILED
-
-Document valid transitions.
-
----
-
-# DATABASE
-
-Create a jobs table.
-
-Use UUID identifiers.
-
-Suggested fields:
-
-id
-type
-payload
-status
-result
-error
-created_at
-started_at
-completed_at
-
-Use JSONB for payload and result.
-
-Add appropriate indexes.
-
-At minimum consider indexing:
-
-status
-created_at
-
-Use constraints where appropriate.
-
-Do not add retry-related columns yet unless there is a clear architectural reason.
-
----
-
-# REDIS
-
-Use a Redis Stream.
-
-Suggested stream:
-
-flowforge:jobs
-
-Use a consumer group even though Stage 1 only has one worker.
-
-Suggested group:
-
-flowforge-workers
-
-Stage 1 should demonstrate:
-
-XADD
-XREADGROUP
-XACK
-
-Do NOT implement:
-
-* XAUTOCLAIM
-* dead-letter queues
-* retry queues
-* delayed queues
-* leases
+- worker leases
+- worker heartbeats
+- worker crash recovery
+- PEL recovery / XAUTOCLAIM
+- Dead Letter Queue
+- general-purpose scheduler
+- cron jobs
+- dynamic worker pools
+- Kafka
+- Kubernetes
+- workflow/DAG engine
+- user-facing idempotency keys
+- autoscaling
 
 Those belong to later stages.
 
-Document that Stage 1 deliberately does not provide crash recovery.
+Do not implement them.
 
 ---
 
-# JOB FLOW
+# FIRST: INSPECT CURRENT REPOSITORY
 
-POST /jobs should roughly perform:
+Before modifying code:
 
-1. Validate request.
-2. Create job in PostgreSQL.
-3. Publish a job message to Redis.
-4. Update job state to QUEUED.
-5. Return job ID.
+1. Read AGENTS.md.
+2. Read Stage 1 documentation.
+3. Read all ADRs.
+4. Read Stage 1 architecture.
+5. Read job lifecycle implementation.
+6. Read database schema.
+7. Read Redis queue implementation.
+8. Read worker implementation.
+9. Read current tests.
+10. Read CI and Docker configuration.
 
-The system has a known dual-write limitation between PostgreSQL and Redis.
+Verify Stage 1 assumptions.
 
-Do NOT solve this with a transactional outbox in Stage 1.
+Then provide:
 
-Document this limitation explicitly because the transactional outbox will be introduced in a later stage.
+- current architecture summary
+- Stage 2 architecture proposal
+- files expected to change
+- database migration plan
+- state-machine changes
+- risks
+- testing strategy
+- stage breakdown
 
-If Redis publishing fails after the PostgreSQL insert, the job may remain PENDING.
-
-Do not hide or fake reliability that does not exist.
-
----
-
-# REDIS MESSAGE
-
-A queue message should contain enough information for a worker to locate the job.
-
-Example:
-
-{
-"job_id": "...",
-"type": "echo"
-}
-
-Do not place unnecessary duplicated business state in Redis.
-
-PostgreSQL remains the source of truth for job state.
+Do not code until this plan is internally consistent.
 
 ---
 
-# WORKER
+# STAGE 2A — TRANSACTIONAL OUTBOX
+
+Change job creation from:
+
+DB insert
+→ Redis publish
+
+to:
+
+BEGIN DATABASE TRANSACTION
+
+INSERT job as PENDING
+
+INSERT outbox event
+
+COMMIT
+
+No Redis interaction should happen inside the API request after the transaction.
+
+The API should return success once the durable PostgreSQL transaction has committed.
+
+---
+
+# OUTBOX TABLE
+
+Create a migration for:
+
+outbox_events
+
+Recommended fields:
+
+id
+aggregate_id
+event_type
+payload
+status
+attempts
+last_error
+created_at
+published_at
+
+Use appropriate constraints and indexes.
+
+At minimum consider efficient lookup of pending events.
+
+Do not over-engineer the schema.
+
+---
+
+# OUTBOX EVENT
+
+For job publication, define an event such as:
+
+JOB_CREATED
+
+Payload should contain enough information for the dispatcher to publish the Redis message.
+
+Avoid duplicating unnecessary job state.
+
+PostgreSQL remains the source of truth.
+
+---
+
+# TRANSACTIONAL GUARANTEE
+
+The important guarantee is:
+
+Either:
+
+job exists
+AND
+outbox event exists
+
+or:
+
+neither exists.
+
+This eliminates the Stage 1 failure where the job can exist without a durable record of the required publication.
+
+Document this.
+
+Do not claim exactly-once publication.
+
+---
+
+# STAGE 2B — OUTBOX DISPATCHER
 
 Create a separate executable:
 
-cmd/worker
+cmd/dispatcher
 
-The worker should:
+The dispatcher:
 
-1. Connect to PostgreSQL.
-2. Connect to Redis.
-3. Create/verify its consumer group.
-4. Block waiting for jobs.
-5. Receive a job.
-6. Load the job from PostgreSQL.
-7. Mark it RUNNING.
-8. Execute the registered task handler.
-9. Store result or error.
-10. Mark job COMPLETED or FAILED.
-11. Acknowledge the Redis message.
+1. polls pending outbox events
+2. claims/locks events safely
+3. publishes them to Redis Streams
+4. records successful publication
+5. records publication errors
+6. continues processing future events
 
-Do not build worker pools yet.
+Use PostgreSQL mechanisms appropriate for concurrent polling.
 
-Only one worker process and one consumer are required in Stage 1.
+Investigate:
 
----
+SELECT ... FOR UPDATE SKIP LOCKED
 
-# TASK SYSTEM
+before implementation.
 
-Do not hard-code all task logic inside the worker.
-
-Create a task handler abstraction.
-
-For example conceptually:
-
-TaskHandler interface
-
-with something like:
-
-Handle(ctx, payload) → result/error
-
-Create a task registry.
-
-Initially implement only:
-
-1. echo
-2. sleep
-
-The echo task returns the supplied message.
-
-The sleep task waits for a requested number of seconds and then returns successfully.
-
-This allows the system to demonstrate actual asynchronous execution.
-
-Validate payloads.
-
-Do not execute arbitrary code supplied by users.
+The design must be safe if multiple dispatcher instances eventually exist, even though Stage 2 may run one dispatcher locally.
 
 ---
 
-# ERROR HANDLING
+# IMPORTANT FAILURE CASE
 
 Handle:
 
-* invalid JSON
-* missing required fields
-* unknown job type
-* job not found
-* PostgreSQL failure
-* Redis failure
-* task failure
-* malformed task payload
+Redis publish succeeds
+→ dispatcher crashes
+→ DB transaction marking outbox event PUBLISHED never commits
 
-Return sensible HTTP status codes.
+On restart the event may be published again.
 
-Use structured application errors internally.
+This is expected.
 
-Do not leak database or internal implementation details through the API.
+Therefore Stage 2 uses:
 
----
+AT-LEAST-ONCE PUBLICATION
 
-# HTTP API
+not exactly-once publication.
 
-At minimum:
+Document this clearly.
 
-POST /jobs
-GET /jobs/{id}
-GET /jobs
-GET /healthz
-GET /readyz
-
-Health:
-
-/healthz means the process is alive.
-
-/readyz verifies required dependencies are available.
-
-Do not make health endpoints overly complicated.
+Do not hide duplicate publication.
 
 ---
 
-# CONFIGURATION
+# DUPLICATE MESSAGE HANDLING
 
-Use environment variables.
+Workers must safely handle duplicate Redis messages.
+
+Use atomic database state transitions.
+
+For example:
+
+A job may only be claimed if its current state permits claiming.
+
+The worker must NOT execute a completed job again simply because a duplicate Redis message arrives.
+
+The implementation must distinguish:
+
+- first legitimate delivery
+- duplicate delivery
+- stale delivery
+
+Do not introduce user-level idempotency keys yet.
+
+This is only delivery deduplication using job state/concurrency control.
+
+---
+
+# STAGE 2C — JOB ATTEMPTS
 
 Create:
 
-.env.example
+job_attempts
 
-Include configuration for:
+Fields:
 
-DATABASE_URL
-REDIS_URL
-REDIS_STREAM
-REDIS_CONSUMER_GROUP
-SERVER_PORT
-
-Do not commit secrets.
-
----
-
-# LOGGING
-
-Use structured logging.
-
-Prefer Go's standard structured logger or another lightweight approach.
-
-Every important operation should log useful context such as:
-
+id
 job_id
-job_type
+attempt_number
+worker_id
 status
 error
+started_at
+finished_at
 
-Do not log entire job payloads unnecessarily.
+Every actual execution attempt should produce a record.
 
----
-
-# PROJECT STRUCTURE
-
-Use a clean structure approximately like:
-
-cmd/
-api/
-worker/
-
-internal/
-api/
-jobs/
-queue/
-worker/
-tasks/
-database/
-
-migrations/
-
-tests/
-
-docs/
-architecture/
-stages/
-api/
-adr/
-
-scripts/
-
-Keep responsibilities separated.
-
-Do not create abstractions that have no current purpose.
+This allows the system to preserve execution history rather than only storing the final error.
 
 ---
 
-# TESTING
+# MODIFY JOB MODEL
 
-You MUST write automated tests.
+Add only what is necessary for retries.
 
-## Unit tests
+Potential fields:
 
-Test:
+attempt_count
+max_attempts
+next_attempt_at
+last_error
 
-* job validation
-* job state transitions
-* task registry
-* echo handler
-* sleep handler
-* service logic
+Use appropriate defaults and constraints.
 
-## Integration tests
+Do not create unnecessary retry metadata.
 
-Test:
+---
 
-API
-+
-PostgreSQL
-+
-Redis
+# RETRYABLE VS PERMANENT ERRORS
 
-The integration test should verify the complete flow:
+Task execution errors need a way to communicate whether retrying makes sense.
+
+Introduce a small explicit abstraction.
+
+Example:
+
+TaskError:
+- Err
+- Retryable
+
+The exact interface can differ if you have a cleaner Go design.
+
+Rules:
+
+Retryable error
+→ retry if attempts remain
+
+Permanent error
+→ FAILED immediately
+
+Unknown/unclassified errors
+→ follow a documented default policy
+
+Do not retry invalid task payloads indefinitely.
+
+---
+
+# RETRY STATES
+
+Introduce a state:
+
+RETRY_WAIT
+
+State lifecycle:
+
+PENDING
+→ QUEUED
+→ RUNNING
+→ COMPLETED
+
+or:
+
+RUNNING
+→ RETRY_WAIT
+→ QUEUED
+→ RUNNING
+
+or:
+
+RUNNING
+→ FAILED
+
+after retries are exhausted or the error is permanent.
+
+Update the domain transition model and database transition guards.
+
+---
+
+# RETRY POLICY
+
+Support:
+
+max attempts
+
+Use:
+
+max_attempts = 3
+
+as the default unless configuration already has a better established default.
+
+Do not hard-code policy in multiple places.
+
+Centralize retry calculation.
+
+---
+
+# EXPONENTIAL BACKOFF
+
+Implement:
+
+delay = min(base_delay * 2^(attempt-1), max_delay)
+
+Example:
+
+1 sec
+2 sec
+4 sec
+8 sec
+
+Use configurable:
+
+base delay
+maximum delay
+
+Consider optional jitter.
+
+Document why jitter reduces synchronized retry bursts.
+
+---
+
+# RETRY TIMING
+
+Do NOT build the full general scheduler in Stage 2.
+
+Retry timing only needs to support retryable jobs whose:
+
+next_attempt_at <= now
+
+are eligible to be re-queued.
+
+Reuse the existing outbox/dispatcher architecture where possible.
+
+The purpose is retry timing, not cron scheduling.
+
+Document this distinction.
+
+---
+
+# TEST TASKS
+
+Add appropriate test/demo tasks.
+
+At minimum:
+
+## flaky
+
+Input:
+
+{
+  "failures_before_success": 2
+}
+
+Expected:
+
+attempt 1 → failure
+attempt 2 → failure
+attempt 3 → success
+
+## always_fail
+
+Always returns a retryable failure.
+
+Expected:
+
+attempt 1
+attempt 2
+attempt 3
+→ FAILED
+
+Also test a permanent failure that does not retry.
+
+Keep these tasks safe and deterministic.
+
+---
+
+# DATABASE CONCURRENCY
+
+Investigate and implement safe claiming where needed.
+
+Where an operation can be performed by more than one process, use database-level concurrency protection.
+
+Do not rely only on application-level checks.
+
+Document:
+
+- optimistic state transitions
+- row locking where appropriate
+- SKIP LOCKED if used
+- why the chosen mechanism is safe
+
+---
+
+# OUTBOX POLLING
+
+Avoid naïvely doing:
+
+SELECT all pending events
+
+without considering concurrent dispatcher instances.
+
+Design the query so future horizontal scaling is possible.
+
+If using:
+
+FOR UPDATE SKIP LOCKED
+
+document why.
+
+Do not build a complex distributed scheduler.
+
+---
+
+# OBSERVABILITY
+
+Add metrics for:
+
+outbox_pending
+outbox_published_total
+outbox_publish_failures_total
+job_attempts_total
+job_retries_total
+job_retry_exhausted_total
+job_processing_duration
+
+Update Grafana dashboards if Stage 1 already has dashboards.
+
+Add useful structured logging fields:
+
+job_id
+attempt_number
+outbox_event_id
+worker_id where available
+error
+
+---
+
+# INTEGRATION TESTS
+
+Create real-infrastructure tests.
+
+## Test 1 — Transaction atomicity
+
+Force transaction failure.
+
+Verify:
+
+job does not exist
+AND
+outbox event does not exist.
+
+---
+
+## Test 2 — Normal publication
 
 POST /jobs
-→ job created
-→ Redis message exists
-→ worker processes it
-→ status becomes COMPLETED
-→ result is available
 
-Also test failure:
+Verify:
 
-task execution fails
-→ status becomes FAILED
-→ error is stored
+job persisted
+outbox event persisted
+dispatcher publishes Redis message
+outbox marked published
+worker executes
+job completes
 
-## API tests
+---
 
-Test:
+## Test 3 — Redis outage
 
-201/200 success responses
-400 malformed requests
-404 unknown jobs
-appropriate 5xx dependency failures
+PostgreSQL must still contain:
 
-## Concurrency/race checks
+job
++
+outbox event
 
-The code should pass:
+When Redis becomes available:
 
-go test -race ./...
+dispatcher successfully publishes the event.
+
+This demonstrates the value of the outbox.
+
+---
+
+## Test 4 — Dispatcher duplicate publication
+
+Simulate:
+
+Redis publication succeeds
+then dispatcher fails before marking event published
+
+Restart dispatcher.
+
+Verify duplicate Redis delivery does not execute a completed job a second time.
+
+---
+
+## Test 5 — Retryable failure
+
+flaky task
+
+Expected:
+
+attempt 1
+→ retry
+
+attempt 2
+→ retry
+
+attempt 3
+→ success
+
+Verify attempt history.
+
+---
+
+## Test 6 — Retry exhaustion
+
+always_fail
+
+Expected:
+
+attempt 1
+attempt 2
+attempt 3
+→ FAILED
+
+Verify:
+
+attempt_count = 3
+
+and no further retry occurs.
+
+---
+
+## Test 7 — Permanent failure
+
+Permanent task error.
+
+Verify:
+
+one attempt
+→ FAILED
+
+No retry.
+
+---
+
+## Test 8 — Backoff
+
+Verify retry attempts do not occur immediately.
+
+Avoid fragile exact-time assertions.
+
+Use reasonable timing windows or injectable clock/time abstractions where useful.
+
+---
+
+# UNIT TESTS
+
+Add tests for:
+
+- outbox event construction
+- retry policy
+- backoff calculation
+- jitter calculation if implemented
+- retryable/permanent error classification
+- state transitions
+- duplicate message handling
+- max attempts
+- next_attempt_at calculation
 
 ---
 
 # DOCKER
 
-Create:
+Add dispatcher service to Docker Compose.
 
-Dockerfile
+Final local architecture:
 
-docker-compose.yml
-
-Docker Compose should run:
-
-api
-worker
 postgres
 redis
+api
+dispatcher
+worker
 
-The system should work from:
+Startup must remain deterministic.
 
-docker compose up --build
-
-Provide health checks where practical.
-
-Do not introduce Kubernetes.
-
----
-
-# MAKEFILE
-
-Create useful commands such as:
-
-make build
-make test
-make test-race
-make lint
-make run-api
-make run-worker
-make docker-up
-make docker-down
-
-Make commands should be simple and reliable.
+Migrations must complete before application services depend on the schema.
 
 ---
 
 # CI
 
-Create GitHub Actions CI.
+Update GitHub Actions to test:
 
-On every pull request and push:
+- API
+- worker
+- dispatcher
+- unit tests
+- race detector
+- integration tests
+- Docker build
 
-1. Check formatting.
-2. Run go vet.
-3. Run unit tests.
-4. Run race tests.
-5. Build API.
-6. Build worker.
-7. Build Docker image.
-8. Run integration tests with PostgreSQL and Redis.
-
-Do not create deployment pipelines yet.
-
-This stage establishes CI foundations; deployment/CD will be expanded later.
+Do not add Kubernetes.
 
 ---
 
@@ -601,274 +702,187 @@ This stage establishes CI foundations; deployment/CD will be expanded later.
 
 Create:
 
-docs/stages/stage-01.md
+docs/stages/stage-02.md
 
-It must explain:
+Create architecture update:
 
-* objective
-* architecture
-* components
-* job lifecycle
-* API
-* database schema
-* Redis model
-* worker model
-* known limitations
-* testing
-* how to run locally
-* how to run with Docker
-* acceptance criteria
-* what is intentionally NOT implemented
+docs/architecture/stage-02.md
 
-Create:
+Create ADRs for major decisions:
 
-docs/architecture/stage-01.md
+003-transactional-outbox.md
+004-at-least-once-publication.md
+005-retry-policy.md
 
-Include an architecture diagram using Mermaid.
+Additional ADRs only if actually necessary.
 
-Create:
+Document:
 
-docs/api/openapi.yaml
-
-Document the Stage 1 API.
-
----
-
-# ADR
-
-Create an ADR explaining the decision to use:
-
-PostgreSQL as the source of truth.
-
-Create another ADR explaining:
-
-Redis Streams as the initial queue mechanism.
-
-Each ADR should include:
-
-Context
-Decision
-Alternatives
-Trade-offs
-Consequences
+- why Stage 1 dual-write was unsafe
+- how outbox fixes the durability gap
+- why outbox still permits duplicates
+- how workers handle duplicates
+- retry lifecycle
+- retryable vs permanent failures
+- backoff
+- Stage 2 limitations
+- what remains for Stage 3
 
 ---
 
 # README
 
-The README should contain:
+Update roadmap and architecture.
 
-Project description
-Architecture diagram
-Features
-Tech stack
-Quick start
-API examples
-How workers operate
-Testing
-Roadmap
+Do not claim:
 
-Do not claim features that have not been implemented.
+exactly-once delivery
+exactly-once execution
+crash recovery
+DLQ
+worker leases
+general scheduling
 
----
-
-# DEMO
-
-Create a reproducible demo script.
-
-For example:
-
-scripts/demo.ps1
-
-and/or
-
-scripts/demo.sh
-
-The demo should:
-
-1. Create an echo job.
-2. Print the job ID.
-3. Poll the job.
-4. Show RUNNING.
-5. Show COMPLETED.
-6. Show the final result.
-
-Also demonstrate a sleep task.
-
-The goal is that I can show another person the system in under 2 minutes.
+unless they are actually implemented in a later stage.
 
 ---
 
-# SECURITY
-
-For Stage 1:
-
-* validate input
-* do not execute arbitrary code
-* do not commit secrets
-* do not expose internal errors
-* constrain payload sizes reasonably
-
-Full authentication/RBAC will be a later stage.
-
----
-
-# NON-FUNCTIONAL REQUIREMENTS
-
-The system should be:
-
-* modular
-* testable
-* observable through logs
-* deterministic where practical
-* easy to run locally
-* Dockerized
-* CI-tested
-
-Prioritize correctness and understandability over premature optimization.
-
----
-
-# FAILURE LIMITATIONS TO DOCUMENT
-
-Stage 1 deliberately does NOT guarantee recovery from:
-
-* worker crashes
-* duplicate execution
-* Redis failure between enqueue and processing
-* PostgreSQL/Redis dual-write inconsistency
-* abandoned RUNNING jobs
-
-These become later stages.
-
-Do not pretend Stage 1 is production fault tolerant.
-
----
-
-# GITHUB WORKFLOW
+# GITHUB
 
 Create:
 
-stage/01-basic-job-execution
+stage/02-reliable-delivery
 
-Use small meaningful commits.
+Then use focused feature branches such as:
 
-Suggested commit sequence:
+feature/02a-transactional-outbox
+feature/02b-outbox-dispatcher
+feature/02c-retry-engine
+feature/02d-backoff
+feature/02e-reliability-tests
 
-chore: bootstrap Go project
+Use meaningful commits.
 
-feat(db): add jobs schema and repository
+Examples:
 
-feat(queue): add Redis stream publisher
+feat(outbox): add transactional outbox schema
 
-feat(api): add job submission endpoint
+feat(jobs): persist job creation event atomically
 
-feat(worker): add job consumer and execution
+feat(dispatcher): publish pending outbox events
 
-feat(tasks): add task registry and handlers
+feat(worker): handle duplicate deliveries safely
 
-feat(api): add job status and listing
+feat(retry): add attempt tracking
 
-test: add job execution integration tests
+feat(retry): add exponential backoff
 
-ci: add GitHub Actions pipeline
+test(retry): add retry lifecycle integration tests
 
-docs: document stage 1 architecture
-
-docs: add stage 1 demo
-
-Do not squash away meaningful history unless necessary.
-
----
-
-# IMPLEMENTATION PROCESS
-
-Before changing code:
-
-1. Inspect the repository.
-2. Inspect AGENTS.md.
-3. Inspect existing docs.
-4. Explain the Stage 1 implementation plan.
-5. Identify important design decisions.
-6. Identify files you expect to create/change.
-
-Then implement Stage 1.
-
-After implementation:
-
-1. Run formatting.
-2. Run vet.
-3. Run tests.
-4. Run race detection.
-5. Run integration tests.
-6. Build API.
-7. Build worker.
-8. Build Docker image.
-9. Run Docker Compose.
-10. Execute the demo.
-11. Review for dead code and unnecessary abstractions.
-12. Update documentation.
-13. Show the final file tree.
-14. Summarize what was implemented.
-15. List known limitations.
-16. List any remaining issues.
+docs(stage-02): document reliable delivery
 
 ---
 
-# CRITICAL CONSTRAINTS
+# STAGE 2 ACCEPTANCE CRITERIA
 
-Do NOT implement:
+Stage 2 is complete only when:
 
-* retries
-* exponential backoff
-* priority queues
-* scheduling
-* cron
-* worker pools
-* leases
-* heartbeats
-* crash recovery
-* DLQ
-* idempotency
-* workflow engine
-* Kafka
-* Kubernetes
-* distributed locks
-* autoscaling
-
-Those belong to future stages.
-
-Do not solve future problems prematurely.
-
-However, structure the current interfaces so later stages can extend them without rewriting the entire codebase.
+1. Job creation atomically persists job + outbox event.
+2. API no longer publishes directly to Redis.
+3. Dispatcher publishes pending events.
+4. Dispatcher handles Redis failures without losing the durable publication request.
+5. Duplicate publication is safely tolerated.
+6. Worker cannot execute the same completed job again because of duplicate delivery.
+7. Job attempts are persisted.
+8. Retryable errors retry.
+9. Permanent errors do not retry.
+10. Retry count is bounded.
+11. Exponential backoff works.
+12. Retry history is queryable.
+13. Redis outage test passes.
+14. Dispatcher restart test passes.
+15. Retry integration tests pass.
+16. Race detector passes.
+17. Docker Compose starts API, dispatcher, worker, Postgres and Redis successfully.
+18. CI passes.
+19. Documentation is complete.
+20. Stage 2 demo works.
 
 ---
 
-# FINAL ACCEPTANCE CRITERIA
+# REQUIRED DEMO
 
-Stage 1 is complete only when:
+Create a deterministic demonstration:
 
-1. `docker compose up --build` successfully starts the system.
-2. API accepts a job.
-3. Job appears in PostgreSQL.
-4. Job is published to Redis.
-5. Worker consumes it.
-6. Worker executes the registered task.
-7. Job becomes COMPLETED.
-8. Result is persisted.
-9. Failed task becomes FAILED.
-10. GET /jobs/{id} returns correct state.
-11. GET /jobs supports pagination.
-12. Health/readiness endpoints work.
-13. Integration tests pass.
-14. `go test -race ./...` passes.
-15. CI passes.
-16. README is accurate.
-17. Stage documentation exists.
-18. Architecture diagram exists.
-19. API specification exists.
-20. Demo script works.
+### Demo A — Outbox reliability
 
-Do not move to Stage 2 until every acceptance criterion is satisfied.
+Stop Redis.
 
-After finishing, stop and produce a Stage 1 completion report rather than beginning Stage 2.
+Submit a job.
+
+Show:
+
+job exists in PostgreSQL
++
+outbox event exists.
+
+Start Redis.
+
+Show:
+
+dispatcher publishes it
+→ worker executes
+→ COMPLETED.
+
+### Demo B — Retry
+
+Submit flaky task.
+
+Show:
+
+attempt 1
+→ retry wait
+→ attempt 2
+→ retry wait
+→ attempt 3
+→ COMPLETED.
+
+### Demo C — Exhaustion
+
+Submit always_fail.
+
+Show:
+
+attempt 1
+attempt 2
+attempt 3
+→ FAILED.
+
+This should be demonstrable in under 3 minutes.
+
+---
+
+# FINAL STAGE REPORT
+
+After implementation, report:
+
+1. Architecture changes.
+2. Database changes.
+3. Outbox lifecycle.
+4. Dispatcher lifecycle.
+5. Retry lifecycle.
+6. Duplicate-delivery behavior.
+7. Tests added.
+8. Docker changes.
+9. CI changes.
+10. Metrics added.
+11. Documentation added.
+12. Commands actually executed.
+13. Test results.
+14. Known limitations.
+15. Stage 3 prerequisites.
+16. 15 interview questions I should now be able to answer.
+
+Do NOT start Stage 3.
+
+STOP after Stage 2 is complete.
