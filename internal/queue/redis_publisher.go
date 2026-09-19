@@ -26,6 +26,10 @@ func NewRedisPublisher(client *redis.Client, stream string) *RedisPublisher {
 func (p *RedisPublisher) Publish(ctx context.Context, jobID uuid.UUID, jobType string) error {
 	args := &redis.XAddArgs{
 		Stream: p.stream,
+		// MaxLen and Approx mitigate unbound stream growth. We retain approx 10000 entries
+		// to allow for post-mortem debugging and Delayed/Dead Letter processing in Stage 2.
+		MaxLen: 10000,
+		Approx: true,
 		Values: map[string]interface{}{
 			"job_id": jobID.String(),
 			"type":   jobType,

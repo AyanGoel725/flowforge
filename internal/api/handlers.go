@@ -11,8 +11,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/redis/go-redis/v9"
 
 	"github.com/flowforge/flowforge/internal/jobs"
 )
@@ -60,6 +58,8 @@ func handleCreateJob(svc *jobs.Service) http.HandlerFunc {
 			switch {
 			case errors.Is(err, jobs.ErrEmptyType):
 				writeError(w, http.StatusBadRequest, err.Error(), "EMPTY_TYPE")
+			case errors.Is(err, jobs.ErrUnsupportedType):
+				writeError(w, http.StatusBadRequest, err.Error(), "UNSUPPORTED_TYPE")
 			case errors.Is(err, jobs.ErrInvalidPayload):
 				writeError(w, http.StatusBadRequest, err.Error(), "INVALID_PAYLOAD")
 			case errors.Is(err, jobs.ErrPayloadTooLarge):
@@ -111,19 +111,25 @@ func handleListJobs(svc *jobs.Service) http.HandlerFunc {
 		offset := 0
 
 		if lStr := r.URL.Query().Get("limit"); lStr != "" {
-			if l, err := strconv.Atoi(lStr); err == nil && l > 0 {
-				if l > 100 {
-					limit = 100
-				} else {
-					limit = l
-				}
+			l, err := strconv.Atoi(lStr)
+			if err != nil || l <= 0 {
+				writeError(w, http.StatusBadRequest, "invalid limit parameter", "INVALID_LIMIT")
+				return
+			}
+			if l > 100 {
+				limit = 100
+			} else {
+				limit = l
 			}
 		}
 
 		if oStr := r.URL.Query().Get("offset"); oStr != "" {
-			if o, err := strconv.Atoi(oStr); err == nil && o >= 0 {
-				offset = o
+			o, err := strconv.Atoi(oStr)
+			if err != nil || o < 0 {
+				writeError(w, http.StatusBadRequest, "invalid offset parameter", "INVALID_OFFSET")
+				return
 			}
+			offset = o
 		}
 
 		jobList, total, err := svc.ListJobs(r.Context(), limit, offset)
@@ -153,14 +159,14 @@ func handleHealth() http.HandlerFunc {
 }
 
 // handleReady returns readiness check for dependencies.
-func handleReady(pool *pgxpool.Pool, rdb *redis.Client) http.HandlerFunc {
+func handleReady(pg Pinger, rdb Pinger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 
 		pgStatus := "connected"
-		if pool != nil {
-			if err := pool.Ping(ctx); err != nil {
+		if pg != nil {
+			if err := pg.Ping(ctx); err != nil {
 				pgStatus = "disconnected"
 			}
 		} else {
@@ -169,7 +175,7 @@ func handleReady(pool *pgxpool.Pool, rdb *redis.Client) http.HandlerFunc {
 
 		redisStatus := "connected"
 		if rdb != nil {
-			if err := rdb.Ping(ctx).Err(); err != nil {
+			if err := rdb.Ping(ctx); err != nil {
 				redisStatus = "disconnected"
 			}
 		} else {

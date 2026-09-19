@@ -5,12 +5,14 @@ import (
 )
 
 func TestValidTransitions(t *testing.T) {
-	// Table of valid transitions
+	// Table of valid transitions for Stage 2
 	validPairs := [][2]Status{
 		{StatusPending, StatusQueued},
 		{StatusQueued, StatusRunning},
 		{StatusRunning, StatusCompleted},
 		{StatusRunning, StatusFailed},
+		{StatusRunning, StatusRetryWait},
+		{StatusRetryWait, StatusQueued},
 	}
 
 	for _, pair := range validPairs {
@@ -25,19 +27,27 @@ func TestValidTransitions(t *testing.T) {
 		{StatusPending, StatusRunning},
 		{StatusPending, StatusCompleted},
 		{StatusPending, StatusFailed},
+		{StatusPending, StatusRetryWait},
 		{StatusQueued, StatusPending},
 		{StatusQueued, StatusCompleted},
 		{StatusQueued, StatusFailed},
+		{StatusQueued, StatusRetryWait},
 		{StatusRunning, StatusPending},
 		{StatusRunning, StatusQueued},
+		{StatusRetryWait, StatusPending},
+		{StatusRetryWait, StatusRunning},
+		{StatusRetryWait, StatusCompleted},
+		{StatusRetryWait, StatusFailed},
 		{StatusCompleted, StatusPending},
 		{StatusCompleted, StatusQueued},
 		{StatusCompleted, StatusRunning},
 		{StatusCompleted, StatusFailed},
+		{StatusCompleted, StatusRetryWait},
 		{StatusFailed, StatusPending},
 		{StatusFailed, StatusQueued},
 		{StatusFailed, StatusRunning},
 		{StatusFailed, StatusCompleted},
+		{StatusFailed, StatusRetryWait},
 		{"UNKNOWN", StatusPending},
 	}
 

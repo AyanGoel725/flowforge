@@ -1,0 +1,210 @@
+===============================================================================
+FlowForge (Stage 2) - Manual Testing & Verification Guide
+===============================================================================
+
+This guide provides step-by-step instructions and PowerShell commands using
+`Invoke-RestMethod` to manually test and inspect FlowForge.
+
+-------------------------------------------------------------------------------
+1. STARTING THE ENVIRONMENT
+-------------------------------------------------------------------------------
+
+Option A: Run everything with Docker Compose (Recommended)
+----------------------------------------------------------
+# Start PostgreSQL, Redis, Migrations, API Server, Dispatcher, and Worker
+docker compose up --build -d
+
+# Verify all containers are running and healthy
+docker compose ps
+
+Option B: Run services individually on host
+-------------------------------------------
+# 1. Start Postgres and Redis
+docker compose up -d postgres redis
+
+# 2. Apply database migrations
+go run ./cmd/migrate
+
+# 3. Start API Server (Terminal 1)
+go run ./cmd/api
+
+# 4. Start Outbox & Retry Dispatcher (Terminal 2)
+go run ./cmd/dispatcher
+
+# 5. Start Worker Daemon (Terminal 3)
+go run ./cmd/worker
+
+
+-------------------------------------------------------------------------------
+2. HEALTH & READINESS PROBES
+-------------------------------------------------------------------------------
+
+# Check API Liveness Probe:
+Invoke-RestMethod -Uri "http://localhost:8080/healthz" -Method Get
+
+# Check Readiness Probe (verifies PostgreSQL and Redis connectivity):
+Invoke-RestMethod -Uri "http://localhost:8080/readyz" -Method Get
+
+
+-------------------------------------------------------------------------------
+3. TESTING JOB SUBMISSIONS & RETRY BEHAVIORS
+-------------------------------------------------------------------------------
+
+### A. Echo Job (Basic Success Flow)
+# Submit job:
+$echoJob = Invoke-RestMethod -Uri "http://localhost:8080/jobs" -Method Post `
+  -ContentType "application/json" `
+  -Body (@{
+      type = "echo"
+      payload = @{ message = "Hello FlowForge Stage 2!" }
+  } | ConvertTo-Json)
+
+$echoJobId = $echoJob.id
+Write-Host "Created Echo Job ID: $echoJobId (Status: $($echoJob.status))"
+
+# Check job status and result:
+Invoke-RestMethod -Uri "http://localhost:8080/jobs/$echoJobId" -Method Get
+
+
+---
+### B. Flaky Job (Retries Transient Errors, Succeeds on 3rd Attempt)
+# Submit flaky job with max_attempts = 3:
+$flakyJob = Invoke-RestMethod -Uri "http://localhost:8080/jobs" -Method Post `
+  -ContentType "application/json" `
+  -Body (@{
+      type = "flaky"
+      payload = @{}
+      max_attempts = 3
+  } | ConvertTo-Json)
+
+$flakyJobId = $flakyJob.id
+Write-Host "Created Flaky Job ID: $flakyJobId"
+
+# Poll and observe state transitions: PENDING -> QUEUED -> RUNNING -> RETRY_WAIT -> QUEUED -> ... -> COMPLETED
+1..15 | ForEach-Object {
+    $job = Invoke-RestMethod -Uri "http://localhost:8080/jobs/$flakyJobId" -Method Get
+    Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] Status: $($job.status) | Attempts: $($job.attempt_count)/$($job.max_attempts)"
+    Start-Sleep -Seconds 1
+}
+
+# View final result:
+Invoke-RestMethod -Uri "http://localhost:8080/jobs/$flakyJobId" -Method Get | Format-List
+
+
+---
+### C. Always Fail Job (Transient Error That Exhausts Retries)
+# Submit job configured to fail on every attempt:
+$afJob = Invoke-RestMethod -Uri "http://localhost:8080/jobs" -Method Post `
+  -ContentType "application/json" `
+  -Body (@{
+      type = "always_fail"
+      payload = @{}
+      max_attempts = 3
+  } | ConvertTo-Json)
+
+$afJobId = $afJob.id
+Write-Host "Created Always Fail Job ID: $afJobId"
+
+# Poll until retries are exhausted and status transitions to FAILED:
+1..15 | ForEach-Object {
+    $job = Invoke-RestMethod -Uri "http://localhost:8080/jobs/$afJobId" -Method Get
+    Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] Status: $($job.status) | Attempts: $($job.attempt_count)/$($job.max_attempts)"
+    Start-Sleep -Seconds 1
+}
+
+# Inspect recorded error and attempt details:
+Invoke-RestMethod -Uri "http://localhost:8080/jobs/$afJobId" -Method Get | Format-List
+
+
+---
+### D. Permanent Fail Job (Non-Retryable Immediate Failure)
+# Submit permanent failing job:
+$pfJob = Invoke-RestMethod -Uri "http://localhost:8080/jobs" -Method Post `
+  -ContentType "application/json" `
+  -Body (@{
+      type = "permanent_fail"
+      payload = @{}
+      max_attempts = 5
+  } | ConvertTo-Json)
+
+$pfJobId = $pfJob.id
+Write-Host "Created Permanent Fail Job ID: $pfJobId"
+
+# Check status (transitions to FAILED immediately on attempt 1 without retrying):
+Start-Sleep -Seconds 2
+Invoke-RestMethod -Uri "http://localhost:8080/jobs/$pfJobId" -Method Get | Format-List
+
+
+---
+### E. Sleep Job (Asynchronous Execution Timing)
+# Submit sleep job for 3 seconds:
+$sleepJob = Invoke-RestMethod -Uri "http://localhost:8080/jobs" -Method Post `
+  -ContentType "application/json" `
+  -Body (@{
+      type = "sleep"
+      payload = @{ seconds = 3 }
+  } | ConvertTo-Json)
+
+$sleepJobId = $sleepJob.id
+Write-Host "Created Sleep Job ID: $sleepJobId"
+
+# Query status:
+Start-Sleep -Seconds 4
+Invoke-RestMethod -Uri "http://localhost:8080/jobs/$sleepJobId" -Method Get | Format-List
+
+
+-------------------------------------------------------------------------------
+4. LISTING JOBS (PAGINATION)
+-------------------------------------------------------------------------------
+
+# List the first 5 jobs:
+$list = Invoke-RestMethod -Uri "http://localhost:8080/jobs?limit=5&offset=0" -Method Get
+Write-Host "Total Jobs in System: $($list.total)"
+$list.jobs | Format-Table id, type, status, attempt_count, created_at
+
+
+-------------------------------------------------------------------------------
+5. TESTING TRANSACTIONAL OUTBOX RESILIENCE (REDIS OUTAGE SIMULATION)
+-------------------------------------------------------------------------------
+
+# 1. Stop Redis container to simulate a broker outage:
+docker compose stop redis
+
+# 2. Submit a job while Redis is offline (API succeeds with 201 Created and PENDING status):
+$outboxJob = Invoke-RestMethod -Uri "http://localhost:8080/jobs" -Method Post `
+  -ContentType "application/json" `
+  -Body (@{
+      type = "echo"
+      payload = @{ message = "Submitted during Redis outage" }
+  } | ConvertTo-Json)
+
+$outboxJobId = $outboxJob.id
+Write-Host "Job submitted during outage. ID: $outboxJobId (Status: $($outboxJob.status))"
+
+# 3. Verify the job is safely recorded in PostgreSQL as PENDING:
+$pendingJob = Invoke-RestMethod -Uri "http://localhost:8080/jobs/$outboxJobId" -Method Get
+Write-Host "Current Job Status: $($pendingJob.status)"
+
+# 4. Restart Redis:
+docker compose start redis
+
+# 5. Wait for the Dispatcher to detect Redis and publish the outbox event:
+Start-Sleep -Seconds 5
+$recoveredJob = Invoke-RestMethod -Uri "http://localhost:8080/jobs/$outboxJobId" -Method Get
+Write-Host "Recovered Job Status: $($recoveredJob.status)"
+$recoveredJob | Format-List
+
+
+-------------------------------------------------------------------------------
+6. RUNNING AUTOMATED TEST SUITES
+-------------------------------------------------------------------------------
+
+# Run all unit tests with race detection:
+go test -v -race ./...
+
+# Run integration tests against running PostgreSQL and Redis:
+$env:DATABASE_URL = "postgres://flowforge:flowforge_password@localhost:5433/flowforge?sslmode=disable"
+$env:REDIS_URL = "redis://localhost:6379"
+$env:REDIS_STREAM = "flowforge:jobs"
+$env:REDIS_CONSUMER_GROUP = "flowforge-workers"
+go test -v -tags=integration ./tests/integration/...

@@ -2,81 +2,76 @@ package jobs
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/google/uuid"
-
-	"github.com/flowforge/flowforge/internal/queue"
 )
 
-// Service coordinates job operations across the database and message queue.
+// Service coordinates job operations across the database.
+// In Stage 2, it publishes jobs exclusively via the Transactional Outbox pattern.
 type Service struct {
-	repo      Repository
-	publisher queue.Publisher
-	logger    *slog.Logger
+	repo   Repository
+	logger *slog.Logger
 }
 
 // NewService creates a new job service.
-func NewService(repo Repository, publisher queue.Publisher, logger *slog.Logger) *Service {
+func NewService(repo Repository, logger *slog.Logger) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Service{
-		repo:      repo,
-		publisher: publisher,
-		logger:    logger,
+		repo:   repo,
+		logger: logger,
 	}
 }
 
-// CreateJob validates the input, inserts a PENDING job into the database,
-// attempts to publish it to the message queue, and transitions it to QUEUED.
-// If queue publishing fails, the job remains in PENDING state (documented dual-write limitation).
-func (s *Service) CreateJob(ctx context.Context, req *CreateJobRequest) (*Job, error) {
+// CreateJob validates the input, and persists a PENDING job and a JOB_CREATED
+// outbox event in a single database transaction.
+// It eliminates the dual-write race from Stage 1: the system guarantees
+// that either both the job and the publication intent exist durably, or neither does.
+	func (s *Service) CreateJob(ctx context.Context, req *CreateJobRequest) (*Job, error) {
 	if err := ValidateCreateRequest(req); err != nil {
 		return nil, err
 	}
 
+	jobID := uuid.New()
+	maxAttempts := DefaultMaxAttempts
+	if req.MaxAttempts != nil && *req.MaxAttempts > 0 {
+		maxAttempts = *req.MaxAttempts
+	}
 	job := &Job{
-		ID:      uuid.New(),
-		Type:    req.Type,
-		Payload: req.Payload,
-		Status:  StatusPending,
+		ID:           jobID,
+		Type:         strings.TrimSpace(req.Type),
+		Payload:      req.Payload,
+		Status:       StatusPending,
+		AttemptCount: 0,
+		MaxAttempts:  maxAttempts,
 	}
 
-	if err := s.repo.Create(ctx, job); err != nil {
-		return nil, fmt.Errorf("persisting job: %w", err)
+	payloadBytes, err := json.Marshal(&JobCreatedPayload{
+		JobID: job.ID,
+		Type:  job.Type,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshaling job created payload: %w", err)
 	}
 
-	s.logger.Info("job created in database", "job_id", job.ID.String(), "status", job.Status)
-
-	// Attempt publishing to queue
-	if s.publisher != nil {
-		// Transition to QUEUED before publishing to ensure that the worker
-		// sees the job as QUEUED when it picks up the message.
-		if err := s.repo.UpdateStatus(ctx, job.ID, StatusPending, StatusQueued); err != nil {
-			s.logger.Error("failed to update job status to QUEUED",
-				"job_id", job.ID.String(),
-				"error", err,
-			)
-			return nil, fmt.Errorf("updating job status to QUEUED: %w", err)
-		}
-		job.Status = StatusQueued
-
-		if err := s.publisher.Publish(ctx, job.ID, job.Type); err != nil {
-			s.logger.Error("failed to publish job to queue; reverting to PENDING",
-				"job_id", job.ID.String(),
-				"error", err,
-			)
-			// Revert to PENDING per documented dual-write limitation
-			_ = s.repo.UpdateStatus(ctx, job.ID, StatusQueued, StatusPending)
-			job.Status = StatusPending
-			return job, nil
-		}
-
-		s.logger.Info("job queued successfully", "job_id", job.ID.String(), "status", job.Status)
+	outboxEvent := &OutboxEvent{
+		ID:          uuid.New(),
+		AggregateID: job.ID,
+		EventType:   "JOB_CREATED",
+		Payload:     payloadBytes,
+		Status:      OutboxStatusPending,
 	}
 
+	if err := s.repo.CreateWithOutbox(ctx, job, outboxEvent); err != nil {
+		return nil, fmt.Errorf("persisting job with outbox event: %w", err)
+	}
+
+	s.logger.Info("job and outbox event created durably", "job_id", job.ID.String(), "status", job.Status)
 	return job, nil
 }
 

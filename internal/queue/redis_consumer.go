@@ -76,11 +76,12 @@ func (c *RedisConsumer) Consume(ctx context.Context) (<-chan Message, error) {
 			}
 
 			// Block for 2 seconds waiting for new messages (ID ">" means unread by any consumer in group)
+			// Fetching 1 message at a time ensures accurate concurrency control per worker instance.
 			streams, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 				Group:    c.group,
 				Consumer: c.consumerName,
 				Streams:  []string{c.stream, ">"},
-				Count:    10,
+				Count:    1,
 				Block:    2 * time.Second,
 			}).Result()
 
